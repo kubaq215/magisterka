@@ -1,0 +1,2905 @@
+===== context.c =====
+
+#include "ogs-gtp.h"
+
+int __ogs_gtp_domain;
+static ogs_gtp_context_t self;
+static int context_initialized = 0;
+
+static OGS_POOL(pool, ogs_gtp_node_t);
+static OGS_POOL(ogs_gtpu_resource_pool, ogs_gtpu_resource_t);
+
+void ogs_gtp_context_init(int num_of_gtpu_resource)
+{
+    ogs_assert(context_initialized == 0);
+
+    /* Initialize GTP context */
+    memset(&self, 0, sizeof(ogs_gtp_context_t));
+
+    ogs_log_install_domain(&__ogs_gtp_domain, "gtp", ogs_core()->log.level);
+
+    ogs_pool_init(&pool, ogs_app()->pool.gtp_node);
+    ogs_pool_init(&ogs_gtpu_resource_pool, num_of_gtpu_resource);
+
+    context_initialized = 1;
+}
+
+void ogs_gtp_context_final(void)
+{
+    ogs_assert(context_initialized == 1);
+
+    ogs_gtpu_resource_remove_all(&self.gtpu_resource_list);
+    ogs_pool_final(&ogs_gtpu_resource_pool);
+
+    ogs_gtp_node_remove_all(&self.gtpu_peer_list);
+    ogs_pool_final(&pool);
+
+    context_initialized = 0;
+}
+
+ogs_gtp_context_t *ogs_gtp_self(void)
+{
+    return &self;
+}
+
+static int ogs_gtp_context_prepare(void)
+{
+    self.gtpc_port = OGS_GTPV2_C_UDP_PORT;
+    self.gtpu_port = OGS_GTPV1_U_UDP_PORT;
+
+    return OGS_OK;
+}
+
+static int ogs_gtp_context_validation(const char *local)
+{
+    return OGS_OK;
+}
+
+int ogs_gtp_context_parse_config(const char *local, const char *remote)
+{
+    int rv;
+    yaml_document_t *document = NULL;
+    ogs_yaml_iter_t root_iter;
+    int idx = 0;
+
+    document = ogs_app()->document;
+    ogs_assert(document);
+
+    rv = ogs_gtp_context_prepare();
+    if (rv != OGS_OK) return rv;
+
+    ogs_yaml_iter_init(&root_iter, document);
+    while (ogs_yaml_iter_next(&root_iter)) {
+        const char *root_key = ogs_yaml_iter_key(&root_iter);
+        ogs_assert(root_key);
+        if ((!strcmp(root_key, local)) &&
+            (idx++ == ogs_app()->config_section_id)) {
+            ogs_yaml_iter_t local_iter;
+            ogs_yaml_iter_recurse(&root_iter, &local_iter);
+            while (ogs_yaml_iter_next(&local_iter)) {
+                const char *local_key = ogs_yaml_iter_key(&local_iter);
+                ogs_assert(local_key);
+                if (!strcmp(local_key, "gtpc")) {
+                    ogs_yaml_iter_t gtpc_iter;
+                    ogs_yaml_iter_recurse(&local_iter, &gtpc_iter);
+                    while (ogs_yaml_iter_next(&gtpc_iter)) {
+                        const char *gtpc_key = ogs_yaml_iter_key(&gtpc_iter);
+                        ogs_assert(gtpc_key);
+                        if (!strcmp(gtpc_key, "server")) {
+                            ogs_yaml_iter_t server_array, server_iter;
+                            ogs_yaml_iter_recurse(&gtpc_iter, &server_array);
+                            do {
+                                int family = AF_UNSPEC;
+                                int i, num = 0;
+                                const char *hostname[OGS_MAX_NUM_OF_HOSTNAME];
+                                uint16_t port = self.gtpc_port;
+                                const char *dev = NULL;
+                                ogs_sockaddr_t *addr = NULL;
+
+                                ogs_sockopt_t option;
+                                bool is_option = false;
+
+                                if (ogs_yaml_iter_type(&server_array) ==
+                                        YAML_MAPPING_NODE) {
+                                    memcpy(&server_iter, &server_array,
+                                            sizeof(ogs_yaml_iter_t));
+                                } else if (ogs_yaml_iter_type(&server_array) ==
+                                    YAML_SEQUENCE_NODE) {
+                                    if (!ogs_yaml_iter_next(&server_array))
+                                        break;
+                                    ogs_yaml_iter_recurse(
+                                            &server_array, &server_iter);
+                                } else if (ogs_yaml_iter_type(&server_array) ==
+                                    YAML_SCALAR_NODE) {
+                                    break;
+                                } else
+                                    ogs_assert_if_reached();
+
+                                while (ogs_yaml_iter_next(&server_iter)) {
+                                    const char *server_key =
+                                        ogs_yaml_iter_key(&server_iter);
+                                    ogs_assert(server_key);
+                                    if (!strcmp(server_key, "family")) {
+                                        const char *v =
+                                            ogs_yaml_iter_value(&server_iter);
+                                        if (v) family = atoi(v);
+                                        if (family != AF_UNSPEC &&
+                                            family != AF_INET &&
+                                            family != AF_INET6) {
+                                            ogs_warn("Ignore family(%d) : "
+                                                "AF_UNSPEC(%d), "
+                                                "AF_INET(%d), AF_INET6(%d) ",
+                                                family,
+                                                AF_UNSPEC, AF_INET, AF_INET6);
+                                            family = AF_UNSPEC;
+                                        }
+                                    } else if (!strcmp(server_key, "address")) {
+                                        ogs_yaml_iter_t hostname_iter;
+                                        ogs_yaml_iter_recurse(&server_iter,
+                                                &hostname_iter);
+                                        ogs_assert(ogs_yaml_iter_type(
+                                                    &hostname_iter) !=
+                                                YAML_MAPPING_NODE);
+
+                                        do {
+                                            if (ogs_yaml_iter_type(
+                                                        &hostname_iter) ==
+                                                    YAML_SEQUENCE_NODE) {
+                                                if (!ogs_yaml_iter_next(
+                                                            &hostname_iter))
+                                                    break;
+                                            }
+
+                                            ogs_assert(num <
+                                                    OGS_MAX_NUM_OF_HOSTNAME);
+                                            hostname[num++] =
+                                                ogs_yaml_iter_value(
+                                                        &hostname_iter);
+                                        } while (ogs_yaml_iter_type(
+                                                    &hostname_iter) ==
+                                                YAML_SEQUENCE_NODE);
+                                    } else if (!strcmp(server_key, "port")) {
+                                        const char *v =
+                                            ogs_yaml_iter_value(&server_iter);
+                                        if (v) port = atoi(v);
+                                    } else if (!strcmp(server_key, "dev")) {
+                                        dev = ogs_yaml_iter_value(&server_iter);
+                                    } else if (!strcmp(server_key, "option")) {
+                                        rv = ogs_app_parse_sockopt_config(
+                                                &server_iter, &option);
+                                        if (rv != OGS_OK) {
+                                            ogs_error("ogs_app_parse_sockopt_"
+                                                    "config() failed");
+                                            return rv;
+                                        }
+                                        is_option = true;
+                                    } else if (!strcmp(server_key, "tac")) {
+                                        /* Nothing */
+                                    } else if (!strcmp(
+                                                server_key, "e_cell_id")) {
+                                        /* Nothing */
+                                    } else
+                                        ogs_warn("unknown key `%s`",
+                                                server_key);
+                                }
+
+                                /* Add address information */
+                                addr = NULL;
+                                for (i = 0; i < num; i++) {
+                                    rv = ogs_addaddrinfo(&addr,
+                                            family, hostname[i], port, 0);
+                                    ogs_assert(rv == OGS_OK);
+                                }
+
+                                /* Add each address as a separate socknode */
+                                if (addr) {
+                                    ogs_sockaddr_t *current = addr;
+                                    while (current) {
+                                        if (current->ogs_sa_family ==
+                                                AF_INET &&
+                                            ogs_global_conf()->
+                                                parameter.no_ipv4 == 0) {
+                                            ogs_socknode_add(&self.gtpc_list,
+                                                             AF_INET, current,
+                                                             is_option ?
+                                                             &option : NULL);
+                                        }
+                                        if (current->ogs_sa_family ==
+                                                AF_INET6 &&
+                                            ogs_global_conf()->
+                                                parameter.no_ipv6 == 0) {
+                                            ogs_socknode_add(&self.gtpc_list6,
+                                                             AF_INET6, current,
+                                                             is_option ?
+                                                             &option : NULL);
+                                        }
+                                        current = current->next;
+                                    }
+                                    ogs_freeaddrinfo(addr);
+                                }
+
+                                if (dev) {
+                                    rv = ogs_socknode_probe(
+                                            ogs_global_conf()->parameter.
+                                            no_ipv4 ?
+                                                NULL : &self.gtpc_list,
+                                            ogs_global_conf()->parameter.
+                                            no_ipv6 ?
+                                                NULL : &self.gtpc_list6,
+                                            dev, port,
+                                            is_option ? &option : NULL);
+                                    ogs_assert(rv == OGS_OK);
+                                }
+
+                            } while (ogs_yaml_iter_type(&server_array) ==
+                                    YAML_SEQUENCE_NODE);
+
+                        } else if (!strcmp(gtpc_key, "client")) {
+                            /* handle config in application */
+                        } else
+                            ogs_warn("unknown key `%s`", gtpc_key);
+                    }
+                } else if (!strcmp(local_key, "gtpu")) {
+                    ogs_list_t list, list6;
+                    ogs_socknode_t *node = NULL, *node6 = NULL;
+                    ogs_socknode_t *iter = NULL, *next_iter = NULL;
+
+                    ogs_yaml_iter_t gtpu_iter;
+                    ogs_yaml_iter_recurse(&local_iter, &gtpu_iter);
+                    while (ogs_yaml_iter_next(&gtpu_iter)) {
+                        const char *gtpu_key = ogs_yaml_iter_key(&gtpu_iter);
+                        ogs_assert(gtpu_key);
+                        if (!strcmp(gtpu_key, "server")) {
+                            ogs_yaml_iter_t server_array, server_iter;
+                            ogs_yaml_iter_recurse(&gtpu_iter, &server_array);
+                            do {
+                                int family = AF_UNSPEC;
+                                int i, num_of_hostname = 0;
+                                const char *hostname[OGS_MAX_NUM_OF_HOSTNAME];
+                                int num_of_advertise = 0;
+                                const char *advertise[OGS_MAX_NUM_OF_HOSTNAME];
+                                uint16_t port = self.gtpu_port;
+                                const char *dev = NULL;
+                                ogs_sockaddr_t *addr = NULL;
+                                ogs_sockaddr_t *adv_addr = NULL;
+                                ogs_sockaddr_t *adv_addr6 = NULL;
+                                const char *teid_range_indication = NULL;
+                                const char *teid_range = NULL;
+                                const char *network_instance = NULL;
+                                const char *source_interface = NULL;
+
+                                ogs_sockopt_t option;
+                                bool is_option = false;
+
+                                if (ogs_yaml_iter_type(&server_array) ==
+                                        YAML_MAPPING_NODE) {
+                                    memcpy(&server_iter, &server_array,
+                                            sizeof(ogs_yaml_iter_t));
+                                } else if (ogs_yaml_iter_type(&server_array) ==
+                                        YAML_SEQUENCE_NODE) {
+                                    if (!ogs_yaml_iter_next(&server_array))
+                                        break;
+                                    ogs_yaml_iter_recurse(
+                                            &server_array, &server_iter);
+                                } else if (ogs_yaml_iter_type(&server_array) ==
+                                    YAML_SCALAR_NODE) {
+                                    break;
+                                } else
+                                    ogs_assert_if_reached();
+
+                                while (ogs_yaml_iter_next(&server_iter)) {
+                                    const char *server_key =
+                                        ogs_yaml_iter_key(&server_iter);
+                                    ogs_assert(server_key);
+
+                                    if (ogs_list_count(
+                                                &self.gtpu_resource_list) >=
+                                        OGS_MAX_NUM_OF_GTPU_RESOURCE) {
+                                        ogs_warn(
+                                            "[Overflow]: Number of User Plane "
+                                            "IP Resource <= %d",
+                                            OGS_MAX_NUM_OF_GTPU_RESOURCE);
+                                        break;
+                                    }
+
+                                    if (!strcmp(server_key, "family")) {
+                                        const char *v =
+                                            ogs_yaml_iter_value(&server_iter);
+                                        if (v) family = atoi(v);
+                                        if (family != AF_UNSPEC &&
+                                            family != AF_INET &&
+                                            family != AF_INET6) {
+                                            ogs_warn("Ignore family(%d)"
+                                                ": AF_UNSPEC(%d), "
+                                                "AF_INET(%d), AF_INET6(%d) ",
+                                                family,
+                                                AF_UNSPEC, AF_INET, AF_INET6);
+                                            family = AF_UNSPEC;
+                                        }
+                                    } else if (!strcmp(server_key, "address")) {
+                                        ogs_yaml_iter_t hostname_iter;
+                                        ogs_yaml_iter_recurse(&server_iter,
+                                                &hostname_iter);
+                                        ogs_assert(ogs_yaml_iter_type(
+                                                    &hostname_iter) !=
+                                                YAML_MAPPING_NODE);
+
+                                        do {
+                                            if (ogs_yaml_iter_type(
+                                                        &hostname_iter) ==
+                                                    YAML_SEQUENCE_NODE) {
+                                                if (!ogs_yaml_iter_next(
+                                                            &hostname_iter))
+                                                    break;
+                                            }
+
+                                            ogs_assert(num_of_hostname <
+                                                    OGS_MAX_NUM_OF_HOSTNAME);
+                                            hostname[num_of_hostname++] =
+                                                ogs_yaml_iter_value(
+                                                        &hostname_iter);
+                                        } while (ogs_yaml_iter_type(
+                                                    &hostname_iter) ==
+                                                YAML_SEQUENCE_NODE);
+                                    } else if (!strcmp(server_key,
+                                                "advertise")) {
+                                        ogs_yaml_iter_t advertise_iter;
+                                        ogs_yaml_iter_recurse(
+                                                &server_iter, &advertise_iter);
+                                        ogs_assert(ogs_yaml_iter_type(
+                                                    &advertise_iter) !=
+                                                YAML_MAPPING_NODE);
+
+                                        do {
+                                            if (ogs_yaml_iter_type(
+                                                        &advertise_iter) ==
+                                                    YAML_SEQUENCE_NODE) {
+                                                if (!ogs_yaml_iter_next(
+                                                            &advertise_iter))
+                                                    break;
+                                            }
+
+                                            ogs_assert(num_of_advertise <
+                                                    OGS_MAX_NUM_OF_HOSTNAME);
+                                            advertise[num_of_advertise++] =
+                                                ogs_yaml_iter_value(
+                                                        &advertise_iter);
+                                        } while (ogs_yaml_iter_type(
+                                                    &advertise_iter) ==
+                                                YAML_SEQUENCE_NODE);
+                                    } else if (!strcmp(server_key, "port")) {
+                                        const char *v =
+                                            ogs_yaml_iter_value(&server_iter);
+                                        if (v) port = atoi(v);
+                                    } else if (!strcmp(server_key, "dev")) {
+                                        dev = ogs_yaml_iter_value(&server_iter);
+                                    } else if (!strcmp(server_key, "option")) {
+                                        rv = ogs_app_parse_sockopt_config(
+                                                &server_iter, &option);
+                                        if (rv != OGS_OK) {
+                                            ogs_error("ogs_app_parse_sockopt_"
+                                                    "config() failed");
+                                            return rv;
+                                        }
+                                        is_option = true;
+                                    } else if (!strcmp(server_key,
+                                                "teid_range_indication")) {
+                                        teid_range_indication =
+                                            ogs_yaml_iter_value(&server_iter);
+                                    } else if (!strcmp(server_key,
+                                                "teid_range")) {
+                                        teid_range = ogs_yaml_iter_value(
+                                                &server_iter);
+                                    } else if (!strcmp(server_key,
+                                                "network_instance")) {
+                                        network_instance =
+                                            ogs_yaml_iter_value(&server_iter);
+                                    } else if (!strcmp(server_key,
+                                                "source_interface")) {
+                                        source_interface =
+                                            ogs_yaml_iter_value(&server_iter);
+                                    } else
+                                        ogs_warn("unknown key `%s`",
+                                                server_key);
+                                }
+
+                                addr = NULL;
+                                for (i = 0; i < num_of_hostname; i++) {
+                                    rv = ogs_addaddrinfo(&addr,
+                                            family, hostname[i], port, 0);
+                                    ogs_assert(rv == OGS_OK);
+                                }
+
+                                ogs_list_init(&list);
+                                ogs_list_init(&list6);
+
+                                if (addr) {
+                                    ogs_sockaddr_t *current = addr;
+                                    while (current) {
+                                        if (current->ogs_sa_family ==
+                                                AF_INET &&
+                                            ogs_global_conf()->
+                                                parameter.no_ipv4 == 0) {
+                                            ogs_socknode_add(&list,
+                                                             AF_INET, current,
+                                                             is_option ?
+                                                             &option : NULL);
+                                        }
+                                        if (current->ogs_sa_family ==
+                                                AF_INET6 &&
+                                            ogs_global_conf()->
+                                                parameter.no_ipv6 == 0) {
+                                            ogs_socknode_add(&list6,
+                                                             AF_INET6, current,
+                                                             is_option ?
+                                                             &option : NULL);
+                                        }
+                                        current = current->next;
+                                    }
+                                    ogs_freeaddrinfo(addr);
+                                }
+
+                                if (dev) {
+                                    rv = ogs_socknode_probe(
+                                        ogs_global_conf()->parameter.no_ipv4 ?
+                                        NULL : &list,
+                                        ogs_global_conf()->parameter.no_ipv6 ?
+                                        NULL : &list6,
+                                        dev, port,
+                                        is_option ? &option : NULL);
+                                    ogs_assert(rv == OGS_OK);
+                                }
+
+                                adv_addr = NULL;
+                                for (i = 0; i < num_of_advertise; i++) {
+                                    rv = ogs_addaddrinfo(&adv_addr,
+                                            family, advertise[i], port, 0);
+                                    ogs_assert(rv == OGS_OK);
+                                }
+                                rv = ogs_copyaddrinfo(&adv_addr6, adv_addr);
+                                ogs_assert(rv == OGS_OK);
+
+                                rv = ogs_filteraddrinfo(&adv_addr, AF_INET);
+                                ogs_assert(rv == OGS_OK);
+                                rv = ogs_filteraddrinfo(&adv_addr6, AF_INET6);
+                                ogs_assert(rv == OGS_OK);
+
+                        /* Find first IPv4/IPv6 address in the list.
+                         *
+                         * In the following configuration,
+                         * 127.0.0.4, 127.0.0.5 and 2001:db8:cafe::1 are ignored
+                         * on PFCP Assocation Response message's
+                         * user plane IP resource information.
+                         *
+                         * gtpu:
+                         *   - addr:
+                         *     - 127.0.0.3
+                         *     - ::1
+                         *     - 127.0.0.4
+                         *     - 127.0.0.5
+                         *     - 2001:db8:cafe::1
+                         *
+                         * To include all user plane IP resource information,
+                         * configure as below:
+                         *
+                         * gtpu:
+                         *   - addr:
+                         *     - 127.0.0.3
+                         *     - ::1
+                         *   - addr: 127.0.0.4
+                         *   - addr
+                         *     - 127.0.0.5
+                         *     - 2001:db8:cafe::1
+                         */
+                                node = ogs_list_first(&list);
+                                node6 = ogs_list_first(&list6);
+                                if (node || node6) {
+                                    ogs_user_plane_ip_resource_info_t info;
+
+                                    memset(&info, 0, sizeof(info));
+                                    ogs_sockaddr_to_user_plane_ip_resource_info(
+                                            adv_addr ? adv_addr :
+                                                node ? node->addr : NULL,
+                                            adv_addr6 ? adv_addr6 :
+                                                node6 ? node6->addr : NULL,
+                                            &info);
+
+                                    if (teid_range_indication) {
+                                        info.teidri = atoi(
+                                                teid_range_indication);
+                                        if (teid_range) {
+                                            info.teid_range = atoi(teid_range);
+                                        }
+                                    }
+                                    if (network_instance) {
+                                        info.assoni = 1;
+                                        ogs_cpystrn(info.network_instance,
+                                            network_instance,
+                                            OGS_MAX_APN_LEN+1);
+                                    }
+                                    if (source_interface) {
+                                        info.assosi = 1;
+                                        info.source_interface =
+                                            atoi(source_interface);
+                                    }
+
+                                    ogs_gtpu_resource_add(
+                                        &self.gtpu_resource_list, &info);
+                                }
+
+                                ogs_list_for_each_safe(&list, next_iter, iter)
+                                    ogs_list_add(&self.gtpu_list, iter);
+                                ogs_list_for_each_safe(&list6, next_iter, iter)
+                                    ogs_list_add(&self.gtpu_list, iter);
+
+                                ogs_freeaddrinfo(adv_addr);
+                                ogs_freeaddrinfo(adv_addr6);
+
+                            } while (ogs_yaml_iter_type(&server_array) ==
+                                    YAML_SEQUENCE_NODE);
+                        } else
+                            ogs_warn("unknown key `%s`", gtpu_key);
+                    }
+                }
+            }
+        }
+    }
+
+    rv = ogs_gtp_context_validation(local);
+    if (rv != OGS_OK) return rv;
+
+    return OGS_OK;
+}
+
+ogs_gtp_node_t *ogs_gtp_node_new(ogs_sockaddr_t *sa_list)
+{
+    ogs_gtp_node_t *node = NULL;
+
+    ogs_assert(sa_list);
+
+    ogs_pool_alloc(&pool, &node);
+    if (!node) {
+        ogs_error("ogs_pool_alloc() failed");
+        return NULL;
+    }
+    memset(node, 0, sizeof(ogs_gtp_node_t));
+
+    node->sa_list = sa_list;
+
+    ogs_list_init(&node->local_list);
+    ogs_list_init(&node->remote_list);
+
+    return node;
+}
+
+void ogs_gtp_node_free(ogs_gtp_node_t *node)
+{
+    ogs_assert(node);
+
+    ogs_gtp_xact_delete_all(node);
+
+    ogs_freeaddrinfo(node->sa_list);
+    ogs_pool_free(&pool, node);
+}
+
+ogs_gtp_node_t *ogs_gtp_node_add_by_f_teid(
+        ogs_list_t *list, ogs_gtp2_f_teid_t *f_teid, uint16_t port)
+{
+    int rv;
+    ogs_gtp_node_t *node = NULL;
+    ogs_sockaddr_t *addr = NULL;
+
+    ogs_assert(list);
+    ogs_assert(f_teid);
+    ogs_assert(port);
+
+    rv = ogs_gtp2_f_teid_to_sockaddr(f_teid, port, &addr);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp2_f_teid_to_sockaddr() failed");
+        return NULL;
+    }
+
+    rv = ogs_filter_ip_version(
+            &addr,
+            ogs_global_conf()->parameter.no_ipv4,
+            ogs_global_conf()->parameter.no_ipv6,
+            ogs_global_conf()->parameter.prefer_ipv4);
+    if (!addr) {
+        ogs_error("ogs_filter_ip_version() failed");
+        return NULL;
+    }
+
+#if 0 /* deprecated */
+    rv = ogs_socknode_fill_scope_id_in_local(addr);
+    ogs_assert(rv == OGS_OK);
+#endif
+
+    node = ogs_gtp_node_new(addr);
+    if (!node) {
+        ogs_error("ogs_gtp_node_new() failed");
+        ogs_freeaddrinfo(addr);
+        return NULL;
+    }
+
+    rv = ogs_gtp2_f_teid_to_ip(f_teid, &node->ip);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp2_f_teid_to_ip() failed");
+        ogs_freeaddrinfo(addr);
+        return NULL;
+    }
+
+    ogs_list_add(list, node);
+
+    return node;
+}
+
+ogs_gtp_node_t *ogs_gtp_node_add_by_addr(ogs_list_t *list, ogs_sockaddr_t *addr)
+{
+    ogs_gtp_node_t *gnode = NULL;
+    ogs_sockaddr_t *new = NULL;
+
+    ogs_assert(list);
+    ogs_assert(addr);
+
+    ogs_assert(OGS_OK == ogs_copyaddrinfo(&new, addr));
+    gnode = ogs_gtp_node_new(new);
+    if (!gnode) {
+        ogs_error("ogs_gtp_node_new() failed");
+        ogs_freeaddrinfo(new);
+        return NULL;
+    }
+
+    memcpy(&gnode->addr, new, sizeof gnode->addr);
+
+    ogs_list_add(list, gnode);
+
+    return gnode;
+}
+
+void ogs_gtp_node_remove(ogs_list_t *list, ogs_gtp_node_t *node)
+{
+    ogs_assert(node);
+
+    ogs_list_remove(list, node);
+
+    ogs_gtp_node_free(node);
+}
+
+void ogs_gtp_node_remove_all(ogs_list_t *list)
+{
+    ogs_gtp_node_t *node = NULL, *next_node = NULL;
+
+    ogs_list_for_each_safe(list, next_node, node)
+        ogs_gtp_node_remove(list, node);
+}
+
+ogs_gtp_node_t *ogs_gtp_node_find_by_addr(
+        ogs_list_t *list, ogs_sockaddr_t *addr)
+{
+    ogs_gtp_node_t *node = NULL;
+
+    ogs_assert(list);
+    ogs_assert(addr);
+
+    ogs_list_for_each(list, node) {
+        if (ogs_sockaddr_is_equal(&node->addr, addr) == true)
+            break;
+    }
+
+    return node;
+}
+
+ogs_gtp_node_t *ogs_gtp_node_find_by_f_teid(
+        ogs_list_t *list, ogs_gtp2_f_teid_t *f_teid)
+{
+    int rv;
+    ogs_gtp_node_t *node = NULL;
+    ogs_ip_t ip;
+
+    ogs_assert(list);
+    ogs_assert(f_teid);
+
+    rv = ogs_gtp2_f_teid_to_ip(f_teid, &ip);
+    ogs_assert(rv == OGS_OK);
+
+    ogs_list_for_each(list, node) {
+        if (memcmp(&node->ip, &ip, sizeof(ip)) == 0)
+            break;
+    }
+
+    return node;
+}
+
+ogs_gtp_node_t *ogs_gtp_node_add_by_ip(
+        ogs_list_t *list, ogs_ip_t *ip, uint16_t port)
+{
+    int rv;
+    ogs_gtp_node_t *node = NULL;
+    ogs_sockaddr_t *addr = NULL;
+
+    ogs_assert(list);
+    ogs_assert(ip);
+    ogs_assert(port);
+
+    rv = ogs_ip_to_sockaddr(ip, port, &addr);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_ip_to_sockaddr() failed");
+        return NULL;
+    }
+
+    rv = ogs_filter_ip_version(
+            &addr,
+            ogs_global_conf()->parameter.no_ipv4,
+            ogs_global_conf()->parameter.no_ipv6,
+            ogs_global_conf()->parameter.prefer_ipv4);
+    if (!addr) {
+        ogs_error("ogs_filter_ip_version() failed");
+        return NULL;
+    }
+
+#if 0 /* deprecated */
+    rv = ogs_socknode_fill_scope_id_in_local(addr);
+    ogs_assert(rv == OGS_OK);
+#endif
+
+    node = ogs_gtp_node_new(addr);
+    if (!node) {
+        ogs_error("ogs_gtp_node_new() failed");
+        ogs_freeaddrinfo(addr);
+        return NULL;
+    }
+
+    memcpy(&node->ip, ip, sizeof(*ip));
+
+    ogs_list_add(list, node);
+
+    return node;
+}
+
+ogs_gtp_node_t *ogs_gtp_node_find_by_ip(ogs_list_t *list, ogs_ip_t *ip)
+{
+    ogs_gtp_node_t *node = NULL;
+
+    ogs_assert(list);
+    ogs_assert(ip);
+
+    ogs_list_for_each(list, node) {
+        if (memcmp(&node->ip, ip, sizeof(*ip)) == 0)
+            break;
+    }
+
+    return node;
+}
+
+ogs_gtpu_resource_t *ogs_gtpu_resource_add(ogs_list_t *list,
+        ogs_user_plane_ip_resource_info_t *info)
+{
+    ogs_gtpu_resource_t *resource = NULL;
+
+    ogs_assert(list);
+    ogs_assert(info);
+
+    ogs_pool_alloc(&ogs_gtpu_resource_pool, &resource);
+    ogs_assert(resource);
+
+    memcpy(&resource->info, info, sizeof(*info));
+
+    ogs_list_add(list, resource);
+
+    return resource;
+}
+
+void ogs_gtpu_resource_remove(ogs_list_t *list,
+        ogs_gtpu_resource_t *resource)
+{
+    ogs_assert(list);
+    ogs_assert(resource);
+
+    ogs_list_remove(list, resource);
+
+    ogs_pool_free(&ogs_gtpu_resource_pool, resource);
+}
+
+void ogs_gtpu_resource_remove_all(ogs_list_t *list)
+{
+    ogs_gtpu_resource_t *resource = NULL, *next_resource = NULL;
+
+    ogs_assert(list);
+
+    ogs_list_for_each_safe(list, next_resource, resource)
+        ogs_gtpu_resource_remove(list, resource);
+}
+===== context.h =====
+
+#if !defined(OGS_GTP_INSIDE) && !defined(OGS_GTP_COMPILATION)
+#error "This header cannot be included directly."
+#endif
+
+#ifndef OGS_GTP_CONTEXT_H
+#define OGS_GTP_CONTEXT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct ogs_gtp_context_s {
+    uint32_t        gtpc_port;      /* GTPC local port */
+    uint32_t        gtpu_port;      /* GTPU local port */
+
+    ogs_list_t      gtpc_list;      /* GTPC IPv4 Server List */
+    ogs_list_t      gtpc_list6;     /* GTPC IPv6 Server List */
+    ogs_sock_t      *gtpc_sock;     /* GTPC IPv4 Socket */
+    ogs_sock_t      *gtpc_sock6;    /* GTPC IPv6 Socket */
+    ogs_sockaddr_t  *gtpc_addr;     /* GTPC IPv4 Address */
+    ogs_sockaddr_t  *gtpc_addr6;    /* GTPC IPv6 Address */
+
+    ogs_list_t      gtpu_list;      /* GTPU IPv4/IPv6 Server List */
+    ogs_sock_t      *gtpu_sock;     /* GTPU IPv4 Socket */
+    ogs_sock_t      *gtpu_sock6;    /* GTPU IPv6 Socket */
+    ogs_sockaddr_t  *gtpu_addr;     /* GTPU IPv4 Address */
+    ogs_sockaddr_t  *gtpu_addr6;    /* GTPU IPv6 Address */
+
+    ogs_ip_t        gtpu_ip;        /* GTPU IP */;
+
+    ogs_list_t      gtpu_peer_list; /* GTPU Node List */
+    ogs_list_t      gtpu_resource_list; /* UP IP Resource List */
+
+    ogs_sockaddr_t *link_local_addr;
+} ogs_gtp_context_t;
+
+#define OGS_SETUP_GTP_NODE(__cTX, __gNODE) \
+    do { \
+        ogs_assert((__cTX)); \
+        ogs_assert((__gNODE)); \
+        (__cTX)->gnode = __gNODE; \
+    } while(0)
+
+/**
+ * This structure represents the commonalities of GTP node such as MME, SGW,
+ * PGW gateway. Some of members may not be used by the specific type of node */
+typedef struct ogs_gtp_node_s {
+    ogs_lnode_t     node;           /* A node of list_t */
+    void            *data_ptr;      /* Can be used by app */
+
+    ogs_sockaddr_t  *sa_list;       /* Socket Address List Candidate */
+
+    ogs_sock_t      *sock;          /* Socket Instance */
+    ogs_sockaddr_t  addr;           /* Remote Address */
+
+    ogs_ip_t        ip;             /* F-TEID IP Address Duplicate Check */
+
+    ogs_list_t      local_list;
+    ogs_list_t      remote_list;
+} ogs_gtp_node_t;
+
+typedef struct ogs_gtpu_resource_s {
+    ogs_lnode_t lnode;
+
+    ogs_user_plane_ip_resource_info_t info;
+} ogs_gtpu_resource_t;
+
+void ogs_gtp_context_init(int num_of_gtpu_resource);
+void ogs_gtp_context_final(void);
+ogs_gtp_context_t *ogs_gtp_self(void);
+int ogs_gtp_context_parse_config(const char *local, const char *remote);
+
+ogs_gtp_node_t *ogs_gtp_node_new(ogs_sockaddr_t *sa_list);
+void ogs_gtp_node_free(ogs_gtp_node_t *node);
+
+ogs_gtp_node_t *ogs_gtp_node_add_by_f_teid(
+        ogs_list_t *list, ogs_gtp2_f_teid_t *f_teid, uint16_t port);
+ogs_gtp_node_t *ogs_gtp_node_add_by_addr(
+        ogs_list_t *list, ogs_sockaddr_t *addr);
+void ogs_gtp_node_remove(ogs_list_t *list, ogs_gtp_node_t *node);
+void ogs_gtp_node_remove_all(ogs_list_t *list);
+
+ogs_gtp_node_t *ogs_gtp_node_find_by_addr(
+        ogs_list_t *list, ogs_sockaddr_t *addr);
+ogs_gtp_node_t *ogs_gtp_node_find_by_f_teid(
+        ogs_list_t *list, ogs_gtp2_f_teid_t *f_teid);
+
+ogs_gtp_node_t *ogs_gtp_node_add_by_ip(
+        ogs_list_t *list, ogs_ip_t *ip, uint16_t port);
+ogs_gtp_node_t *ogs_gtp_node_find_by_ip(ogs_list_t *list, ogs_ip_t *ip);
+
+ogs_gtpu_resource_t *ogs_gtpu_resource_add(ogs_list_t *list,
+        ogs_user_plane_ip_resource_info_t *info);
+void ogs_gtpu_resource_remove(ogs_list_t *list,
+        ogs_gtpu_resource_t *resource);
+void ogs_gtpu_resource_remove_all(ogs_list_t *list);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OGS_GTP_CONTEXT_H */
+===== meson.build =====
+# Copyright (C) 2019 by Sukchan Lee <acetcom@gmail.com>
+
+# This file is part of Open5GS.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+libgtp_sources = files('''
+    ogs-gtp.h
+
+    context.h
+    path.h
+    util.h
+    xact.h
+    v1/build.h
+    v1/conv.h
+    v1/message.h
+    v1/path.h
+    v1/types.h
+    v2/build.h
+    v2/conv.h
+    v2/message.h
+    v2/path.h
+    v2/types.h
+
+    context.c
+    path.c
+    util.c
+    xact.c
+    v1/build.c
+    v1/conv.c
+    v1/message.c
+    v1/path.c
+    v1/types.c
+    v2/build.c
+    v2/conv.c
+    v2/message.c
+    v2/path.c
+    v2/types.c
+'''.split())
+
+libgtp_inc = include_directories('.')
+
+libgtp = library('ogsgtp',
+    sources : libgtp_sources,
+    version : libogslib_version,
+    c_args : '-DOGS_GTP_COMPILATION',
+    include_directories : [libgtp_inc, libinc],
+    dependencies : [libproto_dep, libipfw_dep, libapp_dep],
+    install : true)
+
+libgtp_dep = declare_dependency(
+    link_with : libgtp,
+    include_directories : [libgtp_inc, libinc],
+    dependencies : [libproto_dep, libipfw_dep, libapp_dep])
+===== ogs-gtp.h =====
+
+#ifndef OGS_GTP_H
+#define OGS_GTP_H
+
+#include "ipfw/ogs-ipfw.h"
+#include "proto/ogs-proto.h"
+#include "app/ogs-app.h"
+
+#define OGS_GTPV1_U_UDP_PORT            2152
+#define OGS_GTPV2_C_UDP_PORT            2123
+
+#define OGS_GTP_INSIDE
+
+#include "gtp/v1/message.h"
+#include "gtp/v2/message.h"
+#include "gtp/v1/types.h"
+#include "gtp/v2/types.h"
+#include "gtp/v1/conv.h"
+#include "gtp/v2/conv.h"
+#include "gtp/context.h"
+#include "gtp/v1/build.h"
+#include "gtp/v2/build.h"
+#include "gtp/v1/path.h"
+#include "gtp/v2/path.h"
+#include "gtp/path.h"
+#include "gtp/xact.h"
+#include "gtp/util.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#undef OGS_GTP_INSIDE
+
+extern int __ogs_gtp_domain;
+
+#undef OGS_LOG_DOMAIN
+#define OGS_LOG_DOMAIN __ogs_gtp_domain
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OGS_GTP_H */
+===== path.c =====
+
+#include "ogs-gtp.h"
+
+ogs_sock_t *ogs_gtp_server(ogs_socknode_t *node)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_sock_t *gtp;
+    ogs_assert(node);
+
+    gtp = ogs_udp_server(node->addr, node->option);
+    if (gtp) {
+        ogs_info("gtp_server() [%s]:%d",
+                OGS_ADDR(node->addr, buf), OGS_PORT(node->addr));
+
+        node->sock = gtp;
+    }
+
+    return gtp;
+}
+
+int ogs_gtp_connect(ogs_sock_t *ipv4, ogs_sock_t *ipv6, ogs_gtp_node_t *gnode)
+{
+    ogs_sockaddr_t *addr;
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(ipv4 || ipv6);
+    ogs_assert(gnode);
+    ogs_assert(gnode->sa_list);
+
+    addr = gnode->sa_list;
+    while (addr) {
+        ogs_sock_t *sock = NULL;
+
+        if (addr->ogs_sa_family == AF_INET)
+            sock = ipv4;
+        else if (addr->ogs_sa_family == AF_INET6)
+            sock = ipv6;
+        else
+            ogs_assert_if_reached();
+
+        if (sock) {
+            ogs_info("gtp_connect() [%s]:%d",
+                    OGS_ADDR(addr, buf), OGS_PORT(addr));
+
+            gnode->sock = sock;
+            memcpy(&gnode->addr, addr, sizeof gnode->addr);
+            break;
+        }
+
+        addr = addr->next;
+    }
+
+    if (addr == NULL) {
+        ogs_log_message(OGS_LOG_WARN, ogs_socket_errno,
+                "gtp_connect() [%s]:%d failed",
+                OGS_ADDR(gnode->sa_list, buf), OGS_PORT(gnode->sa_list));
+        return OGS_ERROR;
+    }
+
+    return OGS_OK;
+}
+
+int ogs_gtp_send(ogs_gtp_node_t *gnode, ogs_pkbuf_t *pkbuf)
+{
+    ssize_t sent;
+    ogs_sock_t *sock = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(pkbuf);
+    sock = gnode->sock;
+    ogs_assert(sock);
+
+    sent = ogs_send(sock->fd, pkbuf->data, pkbuf->len, 0);
+    if (sent < 0 || sent != pkbuf->len) {
+        if (ogs_socket_errno != OGS_EAGAIN) {
+            ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno,
+                    "ogs_gtp_send() failed");
+        }
+        return OGS_ERROR;
+    }
+
+    return OGS_OK;
+}
+
+int ogs_gtp_sendto(ogs_gtp_node_t *gnode, ogs_pkbuf_t *pkbuf)
+{
+    ssize_t sent;
+    ogs_sock_t *sock = NULL;
+    ogs_sockaddr_t *addr = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(pkbuf);
+    sock = gnode->sock;
+    ogs_assert(sock);
+    addr = &gnode->addr;
+    ogs_assert(addr);
+
+    sent = ogs_sendto(sock->fd, pkbuf->data, pkbuf->len, 0, addr);
+    if (sent < 0 || sent != pkbuf->len) {
+        if (ogs_socket_errno != OGS_EAGAIN) {
+            char buf[OGS_ADDRSTRLEN];
+            int err = ogs_socket_errno;
+            ogs_log_message(OGS_LOG_ERROR, err,
+                    "ogs_gtp_sendto(%u, %p, %u, 0, %s:%u) failed",
+                    sock->fd, pkbuf->data, pkbuf->len,
+                    OGS_ADDR(addr, buf), OGS_PORT(addr));
+        }
+        return OGS_ERROR;
+    }
+
+    return OGS_OK;
+}
+
+void ogs_gtp_send_error_message(
+        ogs_gtp_xact_t *xact, uint32_t teid, uint8_t type, uint8_t cause_value)
+{
+    switch (xact->gtp_version) {
+    case 1:
+        ogs_gtp1_send_error_message(xact, teid, type, cause_value);
+        break;
+    case 2:
+        ogs_gtp2_send_error_message(xact, teid, type, cause_value);
+        break;
+    }
+}
+===== path.h =====
+
+#if !defined(OGS_GTP_INSIDE) && !defined(OGS_GTP_COMPILATION)
+#error "This header cannot be included directly."
+#endif
+
+#ifndef OGS_GTP_PATH_H
+#define OGS_GTP_PATH_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define OGS_SETUP_GTPC_SERVER \
+    do { \
+        ogs_gtp_self()->gtpc_sock = \
+            ogs_socknode_sock_first(&ogs_gtp_self()->gtpc_list); \
+        ogs_gtp_self()->gtpc_sock6 = \
+            ogs_socknode_sock_first(&ogs_gtp_self()->gtpc_list6); \
+        \
+        if (ogs_gtp_self()->gtpc_sock) \
+            ogs_gtp_self()->gtpc_addr = \
+                &ogs_gtp_self()->gtpc_sock->local_addr; \
+        if (ogs_gtp_self()->gtpc_sock6) \
+            ogs_gtp_self()->gtpc_addr6 = \
+                &ogs_gtp_self()->gtpc_sock6->local_addr; \
+        \
+    } while(0)
+
+#define OGS_SETUP_GTPU_SERVER \
+    do { \
+        ogs_assert(ogs_gtp_self()->gtpu_sock || ogs_gtp_self()->gtpu_sock6); \
+        \
+        if (ogs_gtp_self()->gtpu_sock) \
+            ogs_gtp_self()->gtpu_addr = \
+                &ogs_gtp_self()->gtpu_sock->local_addr; \
+        if (ogs_gtp_self()->gtpu_sock6) \
+            ogs_gtp_self()->gtpu_addr6 = \
+                &ogs_gtp_self()->gtpu_sock6->local_addr; \
+        \
+        ogs_assert(ogs_gtp_self()->gtpu_addr || ogs_gtp_self()->gtpu_addr6); \
+        \
+        ogs_sockaddr_to_ip( \
+                ogs_gtp_self()->gtpu_addr, ogs_gtp_self()->gtpu_addr6, \
+                &ogs_gtp_self()->gtpu_ip); \
+    } while(0)
+
+ogs_sock_t *ogs_gtp_server(ogs_socknode_t *node);
+int ogs_gtp_connect(ogs_sock_t *ipv4, ogs_sock_t *ipv6, ogs_gtp_node_t *gnode);
+
+int ogs_gtp_send(ogs_gtp_node_t *gnode, ogs_pkbuf_t *pkbuf);
+int ogs_gtp_sendto(ogs_gtp_node_t *gnode, ogs_pkbuf_t *pkbuf);
+
+void ogs_gtp_send_error_message(
+        ogs_gtp_xact_t *xact, uint32_t teid, uint8_t type, uint8_t cause_value);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OGS_GTP_PATH_H */
+===== util.c =====
+
+#include "ogs-gtp.h"
+
+int ogs_gtpu_parse_header(
+        ogs_gtp2_header_desc_t *header_desc, ogs_pkbuf_t *pkbuf)
+{
+    ogs_gtp2_header_t *gtp_h = NULL;
+    ogs_gtp2_extension_header_t ext_hdesc;
+    uint8_t *ext_h = NULL;
+    uint16_t len = 0;
+    int i;
+
+    ogs_assert(pkbuf);
+    ogs_assert(pkbuf->data);
+
+    gtp_h = (ogs_gtp2_header_t *)pkbuf->data;
+
+    if (header_desc) {
+        memset(header_desc, 0, sizeof(*header_desc));
+
+        header_desc->flags = gtp_h->flags;
+        header_desc->type = gtp_h->type;
+        header_desc->teid = be32toh(gtp_h->teid);
+    }
+
+    len = OGS_GTPV1U_HEADER_LEN;
+    if (pkbuf->len < len) {
+        ogs_error("the length of the packet is insufficient[%d:%d]",
+                pkbuf->len, len);
+        return -1;
+    }
+
+    if (gtp_h->flags & OGS_GTPU_FLAGS_E) {
+
+        len += OGS_GTPV1U_EXTENSION_HEADER_LEN;
+        if (pkbuf->len < len) {
+            ogs_error("the length of the packet is insufficient[%d:%d]",
+                    pkbuf->len, len);
+            return -1;
+        }
+
+        /*
+         * TS29.281
+         * 5.2.1 General format of the GTP-U Extension Header
+         *
+         * If no such Header follows,
+         * then the value of the Next Extension Header Type shall be 0. */
+
+        i = 0;
+        while (*(ext_h = (((uint8_t *)gtp_h) + len - 1)) &&
+                i < OGS_GTP2_NUM_OF_EXTENSION_HEADER) {
+        /*
+         * The length of the Extension header shall be defined
+         * in a variable length of 4 octets, i.e. m+1 = n*4 octets,
+         * where n is a positive integer.
+         */
+            len += (*(++ext_h)) * 4;
+            if (*ext_h == 0) {
+                ogs_error("No length in the Extension header");
+                return -1;
+            }
+
+            if (((*ext_h) * 4) > OGS_GTP2_MAX_EXTENSION_HEADER_LEN) {
+                ogs_error("Overflow length : %d", (*ext_h));
+                return -1;
+            }
+
+            if (pkbuf->len < len) {
+                ogs_error("the length of the packet is insufficient[%d:%d]",
+                        pkbuf->len, len);
+                return -1;
+            }
+
+            if (!header_desc) /* Skip to extract header content */
+                continue;
+
+            /* Copy Header Content */
+            memcpy(&ext_hdesc.array[i], ext_h-1, (*ext_h) * 4);
+
+            switch (ext_hdesc.array[i].type) {
+            case OGS_GTP2_EXTENSION_HEADER_TYPE_PDU_SESSION_CONTAINER:
+                header_desc->pdu_type = ext_hdesc.array[i].pdu_type;
+                if (ext_hdesc.array[i].pdu_type ==
+                    OGS_GTP2_EXTENSION_HEADER_PDU_TYPE_UL_PDU_SESSION_INFORMATION) {
+                        header_desc->qos_flow_identifier =
+                            ext_hdesc.array[i].qos_flow_identifier;
+                        ogs_trace("   QFI [0x%x]",
+                                header_desc->qos_flow_identifier);
+                }
+                break;
+            case OGS_GTP2_EXTENSION_HEADER_TYPE_UDP_PORT:
+                header_desc->udp.presence = true;
+                header_desc->udp.port = be16toh(ext_hdesc.array[i].udp_port);
+
+                ogs_trace("   UDP Port [%d]", header_desc->udp.port);
+                break;
+            case OGS_GTP2_EXTENSION_HEADER_TYPE_PDCP_NUMBER:
+                header_desc->pdcp_number_presence = true;
+                header_desc->pdcp_number =
+                    be16toh(ext_hdesc.array[i].pdcp_number);
+
+                ogs_trace("   PDCP Number [%d]", header_desc->pdcp_number);
+                break;
+            default:
+                break;
+            }
+
+            i++;
+        }
+
+        if (i >= OGS_GTP2_NUM_OF_EXTENSION_HEADER) {
+            ogs_error("The number of extension headers is limited to [%d]", i);
+            return -1;
+        }
+
+    } else if (gtp_h->flags & (OGS_GTPU_FLAGS_S|OGS_GTPU_FLAGS_PN)) {
+        /*
+         * If and only if one or more of these three flags are set,
+         * the fields Sequence Number, N-PDU and Extension Header
+         * shall be present. The sender shall set all the bits of
+         * the unused fields to zero. The receiver shall not evaluate
+         * the unused fields.
+         * For example, if only the E flag is set to 1, then
+         * the N-PDU Number and Sequence Number fields shall also be present,
+         * but will not have meaningful values and shall not be evaluated.
+         */
+        len += 4;
+    }
+
+    if (pkbuf->len < len) {
+        ogs_error("the length of the packet is insufficient[%d:%d]",
+                pkbuf->len, len);
+        return -1;
+    }
+
+    return len;
+}
+
+uint16_t ogs_in_cksum(uint16_t *addr, int len)
+{
+    int nleft = len;
+    uint32_t sum = 0;
+    uint16_t *w = addr;
+    uint16_t answer = 0;
+
+    // Adding 16 bits sequentially in sum
+    while (nleft > 1) {
+        sum += *w;
+        nleft -= 2;
+        w++;
+    }
+
+    // If an odd byte is left
+    if (nleft == 1) {
+        *(uint8_t *) (&answer) = *(uint8_t *) w;
+        sum += answer;
+    }
+
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum += (sum >> 16);
+    answer = ~sum;
+
+    return answer;
+}
+
+void ogs_gtp2_sender_f_teid(
+        ogs_gtp2_sender_f_teid_t *sender_f_teid, ogs_gtp2_message_t *message)
+{
+    ogs_gtp2_tlv_f_teid_t *tlv_f_teid = NULL;
+    ogs_gtp2_f_teid_t *f_teid = NULL;
+
+    ogs_assert(sender_f_teid);
+    ogs_assert(message);
+
+    memset(sender_f_teid, 0, sizeof(*sender_f_teid));
+
+    switch (message->h.type) {
+    case OGS_GTP2_CREATE_SESSION_REQUEST_TYPE:
+        tlv_f_teid = &message->create_session_request.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_CREATE_SESSION_RESPONSE_TYPE:
+        tlv_f_teid = &message->create_session_response.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_MODIFY_BEARER_REQUEST_TYPE:
+        tlv_f_teid = &message->modify_bearer_request.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_DELETE_SESSION_REQUEST_TYPE:
+        tlv_f_teid = &message->delete_session_request.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_MODIFY_BEARER_COMMAND_TYPE:
+        tlv_f_teid = &message->modify_bearer_command.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_DELETE_BEARER_COMMAND_TYPE:
+        tlv_f_teid = &message->delete_bearer_command.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_BEARER_RESOURCE_COMMAND_TYPE:
+        tlv_f_teid = &message->bearer_resource_command.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE:
+        tlv_f_teid = &message->create_indirect_data_forwarding_tunnel_request.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_RESPONSE_TYPE:
+        tlv_f_teid = &message->create_indirect_data_forwarding_tunnel_response.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_DOWNLINK_DATA_NOTIFICATION_TYPE:
+        tlv_f_teid = &message->downlink_data_notification.
+            sender_f_teid_for_control_plane;
+        break;
+    case OGS_GTP2_MODIFY_ACCESS_BEARERS_REQUEST_TYPE:
+        tlv_f_teid = &message->modify_access_bearers_request.
+            sender_f_teid_for_control_plane;
+    default:
+        break;
+    }
+
+    if (tlv_f_teid && tlv_f_teid->presence && (f_teid = tlv_f_teid->data)) {
+        sender_f_teid->teid_presence = true;
+        sender_f_teid->teid = be32toh(f_teid->teid);
+    }
+}
+===== util.h =====
+
+#if !defined(OGS_GTP_INSIDE) && !defined(OGS_GTP_COMPILATION)
+#error "This header cannot be included directly."
+#endif
+
+#ifndef OGS_GTP_UTIL_H
+#define OGS_GTP_UTIL_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int ogs_gtpu_parse_header(
+        ogs_gtp2_header_desc_t *header_desc, ogs_pkbuf_t *pkbuf);
+uint16_t ogs_in_cksum(uint16_t *addr, int len);
+
+typedef struct ogs_gtp2_sender_f_teid_s {
+    bool teid_presence;
+    uint32_t teid;
+} ogs_gtp2_sender_f_teid_t;
+
+void ogs_gtp2_sender_f_teid(
+        ogs_gtp2_sender_f_teid_t *sender_f_teid, ogs_gtp2_message_t *message);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OGS_GTP_UTIL_H */
+===== xact.c =====
+/*
+ * Copyright (C) 2019 by Sukchan Lee <acetcom@gmail.com>
+ * Copyright (C) 2022 by sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+ *
+ * This file is part of Open5GS.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "ogs-gtp.h"
+#include "ogs-app.h"
+
+typedef enum {
+    GTP_XACT_UNKNOWN_STAGE,
+    GTP_XACT_INITIAL_STAGE,
+    GTP_XACT_INTERMEDIATE_STAGE,
+    GTP_XACT_FINAL_STAGE,
+} ogs_gtp_xact_stage_t;
+
+static int ogs_gtp_xact_initialized = 0;
+static uint32_t g_xact_id = 0;
+
+static OGS_POOL(pool, ogs_gtp_xact_t);
+
+static ogs_gtp_xact_t *ogs_gtp_xact_remote_create(ogs_gtp_node_t *gnode, uint8_t gtp_version, uint32_t sqn);
+static ogs_gtp_xact_stage_t ogs_gtp2_xact_get_stage(uint8_t type, uint32_t xid);
+static ogs_gtp_xact_stage_t ogs_gtp1_xact_get_stage(uint8_t type, uint32_t xid);
+static int ogs_gtp_xact_delete(ogs_gtp_xact_t *xact);
+static int ogs_gtp_xact_update_rx(ogs_gtp_xact_t *xact, uint8_t type);
+
+static void response_timeout(void *data);
+static void holding_timeout(void *data);
+static void peer_timeout(void *data);
+
+int ogs_gtp_xact_init(void)
+{
+    ogs_assert(ogs_gtp_xact_initialized == 0);
+
+    ogs_pool_init(&pool, ogs_app()->pool.xact);
+
+    g_xact_id = 0;
+
+    ogs_gtp_xact_initialized = 1;
+
+    return OGS_OK;
+}
+
+void ogs_gtp_xact_final(void)
+{
+    ogs_assert(ogs_gtp_xact_initialized == 1);
+
+    ogs_pool_final(&pool);
+
+    ogs_gtp_xact_initialized = 0;
+}
+
+ogs_gtp_xact_t *ogs_gtp1_xact_local_create(ogs_gtp_node_t *gnode,
+        ogs_gtp1_header_t *hdesc, ogs_pkbuf_t *pkbuf,
+        void (*cb)(ogs_gtp_xact_t *xact, void *data), void *data)
+{
+    int rv;
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(hdesc);
+
+    ogs_pool_id_calloc(&pool, &xact);
+    ogs_assert(xact);
+    xact->index = ogs_pool_index(&pool, xact);
+
+    xact->gtp_version = 1;
+    xact->org = OGS_GTP_LOCAL_ORIGINATOR;
+    xact->xid = OGS_NEXT_ID(g_xact_id,
+            OGS_GTP1_MIN_XACT_ID, OGS_GTP1_MAX_XACT_ID);
+    xact->gnode = gnode;
+    xact->cb = cb;
+    xact->data = data;
+
+    /* 7.6 "The T3-RESPONSE timer shall be started when a signalling request
+     * message (for which a response has been defined) is sent." */
+    if (hdesc->type != OGS_GTP1_RAN_INFORMATION_RELAY_TYPE) {
+        xact->tm_response = ogs_timer_add(
+                ogs_app()->timer_mgr, response_timeout,
+                OGS_UINT_TO_POINTER(xact->id));
+        ogs_assert(xact->tm_response);
+        xact->response_rcount =
+            ogs_local_conf()->time.message.gtp.n3_response_rcount;
+    }
+
+    xact->tm_holding = ogs_timer_add(
+            ogs_app()->timer_mgr, holding_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_holding);
+    xact->holding_rcount = ogs_local_conf()->time.message.gtp.n3_holding_rcount;
+
+    ogs_list_add(&xact->gnode->local_list, xact);
+
+    rv = ogs_gtp1_xact_update_tx(xact, hdesc, pkbuf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp_xact_update_tx(rv=%d) failed", (int)rv);
+        ogs_gtp_xact_delete(xact);
+        return NULL;
+    }
+
+    ogs_debug("[%d] LOCAL Create  peer [%s]:%d",
+            xact->xid,
+            OGS_ADDR(&gnode->addr, buf),
+            OGS_PORT(&gnode->addr));
+
+    return xact;
+}
+
+ogs_gtp_xact_t *ogs_gtp_xact_local_create(ogs_gtp_node_t *gnode,
+        ogs_gtp2_header_t *hdesc, ogs_pkbuf_t *pkbuf,
+        void (*cb)(ogs_gtp_xact_t *xact, void *data), void *data)
+{
+    int rv;
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(hdesc);
+
+    ogs_pool_id_calloc(&pool, &xact);
+    ogs_assert(xact);
+    xact->index = ogs_pool_index(&pool, xact);
+
+    xact->gtp_version = 2;
+    xact->org = OGS_GTP_LOCAL_ORIGINATOR;
+    xact->xid = OGS_NEXT_ID(g_xact_id,
+            OGS_GTP_MIN_XACT_ID, OGS_GTP_CMD_XACT_ID);
+    if (hdesc->type == OGS_GTP2_MODIFY_BEARER_COMMAND_TYPE ||
+        hdesc->type == OGS_GTP2_DELETE_BEARER_COMMAND_TYPE ||
+        hdesc->type == OGS_GTP2_BEARER_RESOURCE_COMMAND_TYPE) {
+        xact->xid |= OGS_GTP_CMD_XACT_ID;
+    }
+    xact->gnode = gnode;
+    xact->cb = cb;
+    xact->data = data;
+
+    xact->tm_response = ogs_timer_add(
+            ogs_app()->timer_mgr, response_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_response);
+    xact->response_rcount =
+        ogs_local_conf()->time.message.gtp.n3_response_rcount,
+
+    xact->tm_holding = ogs_timer_add(
+            ogs_app()->timer_mgr, holding_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_holding);
+    xact->holding_rcount = ogs_local_conf()->time.message.gtp.n3_holding_rcount,
+
+    xact->tm_peer = ogs_timer_add(ogs_app()->timer_mgr, peer_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_peer);
+
+    ogs_list_add(&xact->gnode->local_list, xact);
+
+    rv = ogs_gtp_xact_update_tx(xact, hdesc, pkbuf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_gtp_xact_update_tx(rv=%d) failed", (int)rv);
+        ogs_gtp_xact_delete(xact);
+        return NULL;
+    }
+
+    ogs_debug("[%d] LOCAL Create  peer [%s]:%d",
+            xact->xid,
+            OGS_ADDR(&gnode->addr, buf),
+            OGS_PORT(&gnode->addr));
+
+    return xact;
+}
+
+static ogs_gtp_xact_t *ogs_gtp_xact_remote_create(ogs_gtp_node_t *gnode, uint8_t gtp_version, uint32_t sqn)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(gnode);
+
+    ogs_pool_id_calloc(&pool, &xact);
+    ogs_assert(xact);
+    xact->index = ogs_pool_index(&pool, xact);
+
+    xact->gtp_version = gtp_version;
+    xact->org = OGS_GTP_REMOTE_ORIGINATOR;
+    xact->xid = (gtp_version == 1) ?
+            OGS_GTP1_SQN_TO_XID(sqn) : OGS_GTP2_SQN_TO_XID(sqn);
+    xact->gnode = gnode;
+
+    xact->tm_response = ogs_timer_add(
+            ogs_app()->timer_mgr, response_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_response);
+    xact->response_rcount =
+        ogs_local_conf()->time.message.gtp.n3_response_rcount,
+
+    xact->tm_holding = ogs_timer_add(
+            ogs_app()->timer_mgr, holding_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_holding);
+    xact->holding_rcount = ogs_local_conf()->time.message.gtp.n3_holding_rcount,
+
+    xact->tm_peer = ogs_timer_add(ogs_app()->timer_mgr, peer_timeout,
+            OGS_UINT_TO_POINTER(xact->id));
+    ogs_assert(xact->tm_peer);
+
+    ogs_list_add(&xact->gnode->remote_list, xact);
+
+    ogs_debug("[%d] REMOTE Create  peer [%s]:%d",
+            xact->xid,
+            OGS_ADDR(&gnode->addr, buf),
+            OGS_PORT(&gnode->addr));
+
+    return xact;
+}
+
+ogs_gtp_xact_t *ogs_gtp_xact_find_by_id(ogs_pool_id_t id)
+{
+    return ogs_pool_find_by_id(&pool, id);
+}
+
+void ogs_gtp_xact_delete_all(ogs_gtp_node_t *gnode)
+{
+    ogs_gtp_xact_t *xact = NULL, *next_xact = NULL;
+
+    ogs_list_for_each_safe(&gnode->local_list, next_xact, xact)
+        ogs_gtp_xact_delete(xact);
+    ogs_list_for_each_safe(&gnode->remote_list, next_xact, xact)
+        ogs_gtp_xact_delete(xact);
+}
+
+int ogs_gtp1_xact_update_tx(ogs_gtp_xact_t *xact,
+        ogs_gtp1_header_t *hdesc, ogs_pkbuf_t *pkbuf)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_stage_t stage;
+    ogs_gtp1_header_t *h = NULL;
+    int gtp_hlen = 0;
+
+    ogs_assert(xact);
+    ogs_assert(xact->gnode);
+    ogs_assert(hdesc);
+    ogs_assert(pkbuf);
+
+    ogs_debug("[%d] %s UPD TX-%d  peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            hdesc->type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    stage = ogs_gtp1_xact_get_stage(hdesc->type, xact->xid);
+    if (xact->org == OGS_GTP_LOCAL_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            if (xact->step != 0) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            ogs_expect(0);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 2 && xact->step != 3) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        default:
+            ogs_assert_if_reached();
+            break;
+        }
+    } else if (xact->org == OGS_GTP_REMOTE_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            ogs_expect(0);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 1) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+        }
+    } else {
+        ogs_error("invalid org[%d]", xact->org);
+        ogs_pkbuf_free(pkbuf);
+        return OGS_ERROR;
+    }
+
+    gtp_hlen = OGS_GTPV1C_HEADER_LEN;
+
+
+    ogs_pkbuf_push(pkbuf, gtp_hlen);
+    h = (ogs_gtp1_header_t *)pkbuf->data;
+    memset(h, 0, gtp_hlen);
+
+    h->version = 1;
+    h->type = hdesc->type;
+    h->pt = 1; /* GTP */
+    h->teid = htobe32(hdesc->teid);
+
+    h->s = 1;
+    h->sqn = OGS_GTP1_XID_TO_SQN(xact->xid);
+    h->length = htobe16(pkbuf->len - 8);
+
+    /* Save Message type and packet of this step */
+    xact->seq[xact->step].type = h->type;
+    xact->seq[xact->step].pkbuf = pkbuf;
+
+    /* Step */
+    xact->step++;
+
+    return OGS_OK;
+}
+
+int ogs_gtp_xact_update_tx(ogs_gtp_xact_t *xact,
+        ogs_gtp2_header_t *hdesc, ogs_pkbuf_t *pkbuf)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_stage_t stage;
+    ogs_gtp2_header_t *h = NULL;
+    int gtp_hlen = 0;
+
+    ogs_assert(xact);
+    ogs_assert(xact->gnode);
+    ogs_assert(hdesc);
+    ogs_assert(pkbuf);
+
+    ogs_debug("[%d] %s UPD TX-%d  peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            hdesc->type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    stage = ogs_gtp2_xact_get_stage(hdesc->type, xact->xid);
+    if (xact->org == OGS_GTP_LOCAL_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            if (xact->step != 0) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            ogs_expect(0);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 2) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        default:
+            ogs_assert_if_reached();
+            break;
+        }
+    } else if (xact->org == OGS_GTP_REMOTE_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            ogs_expect(0);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 1) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_pkbuf_free(pkbuf);
+                return OGS_ERROR;
+            }
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            ogs_pkbuf_free(pkbuf);
+            return OGS_ERROR;
+        }
+    } else {
+        ogs_error("invalid org[%d]", xact->org);
+        ogs_pkbuf_free(pkbuf);
+        return OGS_ERROR;
+    }
+
+    if (hdesc->type > OGS_GTP2_VERSION_NOT_SUPPORTED_INDICATION_TYPE) {
+        gtp_hlen = OGS_GTPV2C_HEADER_LEN;
+    } else {
+        gtp_hlen = OGS_GTPV2C_HEADER_LEN - OGS_GTP2_TEID_LEN;
+    }
+
+    ogs_pkbuf_push(pkbuf, gtp_hlen);
+    h = (ogs_gtp2_header_t *)pkbuf->data;
+    memset(h, 0, gtp_hlen);
+
+    h->version = 2;
+    h->type = hdesc->type;
+
+    if (hdesc->type > OGS_GTP2_VERSION_NOT_SUPPORTED_INDICATION_TYPE) {
+        h->teid_presence = 1;
+        h->teid = htobe32(hdesc->teid);
+        h->sqn = OGS_GTP2_XID_TO_SQN(xact->xid);
+    } else {
+        h->teid_presence = 0;
+        h->sqn_only = OGS_GTP2_XID_TO_SQN(xact->xid);
+    }
+    h->length = htobe16(pkbuf->len - 4);
+
+    /* Save Message type and packet of this step */
+    xact->seq[xact->step].type = h->type;
+    xact->seq[xact->step].pkbuf = pkbuf;
+
+    /* Step */
+    xact->step++;
+
+    return OGS_OK;
+}
+
+static int ogs_gtp_xact_update_rx(ogs_gtp_xact_t *xact, uint8_t type)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_stage_t stage;
+
+    ogs_debug("[%d] %s UPD RX-%d  peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    if (xact->gtp_version == 1)
+        stage = ogs_gtp1_xact_get_stage(type, xact->xid);
+    else
+        stage = ogs_gtp2_xact_get_stage(type, xact->xid);
+
+    if (xact->org == OGS_GTP_LOCAL_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            ogs_expect(0);
+            return OGS_ERROR;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            if (xact->seq[1].type == type) {
+                ogs_pkbuf_t *pkbuf = NULL;
+
+                if (xact->step != 2 && xact->step != 3) {
+                    ogs_error("invalid step[%d]", xact->step);
+                    ogs_pkbuf_free(pkbuf);
+                    return OGS_ERROR;
+                }
+
+                pkbuf = xact->seq[2].pkbuf;
+                if (pkbuf) {
+                    if (xact->tm_holding)
+                        ogs_timer_start(xact->tm_holding,
+                                ogs_local_conf()->time.message.
+                                    gtp.t3_holding_duration);
+
+                    ogs_warn("[%d] %s Request Duplicated. Retransmit!"
+                            " for step %d type %d peer [%s]:%d",
+                            xact->xid,
+                            xact->org == OGS_GTP_LOCAL_ORIGINATOR ?
+                                "LOCAL " : "REMOTE",
+                            xact->step, type,
+                            OGS_ADDR(&xact->gnode->addr,
+                                buf),
+                            OGS_PORT(&xact->gnode->addr));
+                    ogs_expect(OGS_OK == ogs_gtp_sendto(xact->gnode, pkbuf));
+                } else {
+                    ogs_warn("[%d] %s Request Duplicated. Discard!"
+                            " for step %d type %d peer [%s]:%d",
+                            xact->xid,
+                            xact->org == OGS_GTP_LOCAL_ORIGINATOR ?
+                                "LOCAL " : "REMOTE",
+                            xact->step, type,
+                            OGS_ADDR(&xact->gnode->addr,
+                                buf),
+                            OGS_PORT(&xact->gnode->addr));
+                }
+
+                return OGS_RETRY;
+            }
+
+            if (xact->step != 1) {
+                ogs_error("invalid step[%d]", xact->step);
+                return OGS_ERROR;
+            }
+
+            if (xact->tm_holding)
+                ogs_timer_start(xact->tm_holding,
+                        ogs_local_conf()->time.message.gtp.t3_holding_duration);
+
+            break;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 1) {
+                ogs_error("invalid step[%d]", xact->step);
+                return OGS_ERROR;
+            }
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            return OGS_ERROR;
+        }
+    } else if (xact->org == OGS_GTP_REMOTE_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            if (xact->seq[0].type == type) {
+                ogs_pkbuf_t *pkbuf = NULL;
+
+                if (xact->step != 1 && xact->step != 2) {
+                    ogs_error("invalid step[%d]", xact->step);
+                    return OGS_ERROR;
+                }
+
+                pkbuf = xact->seq[1].pkbuf;
+                if (pkbuf) {
+                    if (xact->tm_holding)
+                        ogs_timer_start(xact->tm_holding,
+                                ogs_local_conf()->time.message.
+                                    gtp.t3_holding_duration);
+
+                    ogs_warn("[%d] %s Request Duplicated. Retransmit!"
+                            " for step %d type %d peer [%s]:%d",
+                            xact->xid,
+                            xact->org == OGS_GTP_LOCAL_ORIGINATOR ?
+                                "LOCAL " : "REMOTE",
+                            xact->step, type,
+                            OGS_ADDR(&xact->gnode->addr,
+                                buf),
+                            OGS_PORT(&xact->gnode->addr));
+                    ogs_expect(OGS_OK == ogs_gtp_sendto(xact->gnode, pkbuf));
+                } else {
+                    ogs_warn("[%d] %s Request Duplicated. Discard!"
+                            " for step %d type %d peer [%s]:%d",
+                            xact->xid,
+                            xact->org == OGS_GTP_LOCAL_ORIGINATOR ?
+                                "LOCAL " : "REMOTE",
+                            xact->step, type,
+                            OGS_ADDR(&xact->gnode->addr,
+                                buf),
+                            OGS_PORT(&xact->gnode->addr));
+                }
+
+                return OGS_RETRY;
+            }
+
+            if (xact->step != 0) {
+                ogs_error("invalid step[%d]", xact->step);
+                return OGS_ERROR;
+            }
+            if (xact->tm_holding)
+                ogs_timer_start(xact->tm_holding,
+                        ogs_local_conf()->time.message.gtp.t3_holding_duration);
+
+            break;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            ogs_expect(0);
+            return OGS_ERROR;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 2) {
+                ogs_error("invalid step[%d]", xact->step);
+                return OGS_ERROR;
+            }
+
+            /* continue */
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            return OGS_ERROR;
+        }
+    } else {
+        ogs_error("invalid org[%d]", xact->org);
+        return OGS_ERROR;
+    }
+
+    if (xact->tm_response)
+        ogs_timer_stop(xact->tm_response);
+
+    /* Save Message type of this step */
+    xact->seq[xact->step].type = type;
+
+    /* Step */
+    xact->step++;
+
+    return OGS_OK;
+}
+
+
+int ogs_gtp_xact_commit(ogs_gtp_xact_t *xact)
+{
+    char buf[OGS_ADDRSTRLEN];
+
+    uint8_t type;
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_gtp_xact_stage_t stage;
+
+    ogs_assert(xact);
+    ogs_assert(xact->gnode);
+
+    ogs_debug("[%d] %s Commit  peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    type = xact->seq[xact->step-1].type;
+    if (xact->gtp_version == 1)
+        stage = ogs_gtp1_xact_get_stage(type, xact->xid);
+    else
+        stage = ogs_gtp2_xact_get_stage(type, xact->xid);
+
+    if (xact->org == OGS_GTP_LOCAL_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            if (xact->step != 1) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_gtp_xact_delete(xact);
+                return OGS_ERROR;
+            }
+
+            if (xact->tm_response)
+                ogs_timer_start(xact->tm_response,
+                        ogs_local_conf()->time.message.gtp.
+                        t3_response_duration);
+
+            break;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            if (xact->step != 2) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_gtp_xact_delete(xact);
+                return OGS_ERROR;
+            }
+            return OGS_OK;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 2 && xact->step != 3) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_gtp_xact_delete(xact);
+                return OGS_ERROR;
+            }
+            if (xact->step == 2) {
+                ogs_gtp_xact_delete(xact);
+                return OGS_OK;
+            }
+
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            ogs_gtp_xact_delete(xact);
+            return OGS_ERROR;
+        }
+    } else if (xact->org == OGS_GTP_REMOTE_ORIGINATOR) {
+        switch (stage) {
+        case GTP_XACT_INITIAL_STAGE:
+            ogs_expect(0);
+            ogs_gtp_xact_delete(xact);
+            return OGS_ERROR;
+
+        case GTP_XACT_INTERMEDIATE_STAGE:
+            if (xact->step != 2) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_gtp_xact_delete(xact);
+                return OGS_ERROR;
+            }
+            if (xact->tm_response)
+                ogs_timer_start(xact->tm_response,
+                        ogs_local_conf()->time.message.gtp.
+                        t3_response_duration);
+
+            break;
+
+        case GTP_XACT_FINAL_STAGE:
+            if (xact->step != 2 && xact->step != 3) {
+                ogs_error("invalid step[%d]", xact->step);
+                ogs_gtp_xact_delete(xact);
+                return OGS_ERROR;
+            }
+            if (xact->step == 3) {
+                ogs_gtp_xact_delete(xact);
+                return OGS_OK;
+            }
+
+            break;
+
+        default:
+            ogs_error("invalid stage[%d]", stage);
+            ogs_gtp_xact_delete(xact);
+            return OGS_ERROR;
+        }
+    } else {
+        ogs_error("invalid org[%d]", xact->org);
+        ogs_gtp_xact_delete(xact);
+        return OGS_ERROR;
+    }
+
+    pkbuf = xact->seq[xact->step-1].pkbuf;
+    ogs_assert(pkbuf);
+
+    ogs_expect(OGS_OK == ogs_gtp_sendto(xact->gnode, pkbuf));
+
+    return OGS_OK;
+}
+
+static void response_timeout(void *data)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_pool_id_t xact_id = OGS_INVALID_POOL_ID;
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(data);
+    xact_id = OGS_POINTER_TO_UINT(data);
+    ogs_assert(xact_id >= OGS_MIN_POOL_ID && xact_id <= OGS_MAX_POOL_ID);
+
+    xact = ogs_gtp_xact_find_by_id(xact_id);
+    if (!xact) {
+        ogs_error("GTP Transaction has already been removed [%d]", xact_id);
+        return;;
+    }
+    ogs_assert(xact->gnode);
+
+    ogs_debug("[%d] %s Response Timeout "
+            "for step %d type %d peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            xact->step, xact->seq[xact->step-1].type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    if (--xact->response_rcount > 0) {
+        ogs_pkbuf_t *pkbuf = NULL;
+
+        if (xact->tm_response)
+            ogs_timer_start(xact->tm_response,
+                    ogs_local_conf()->time.message.gtp.t3_response_duration);
+
+        pkbuf = xact->seq[xact->step-1].pkbuf;
+        ogs_assert(pkbuf);
+
+        ogs_expect(OGS_OK == ogs_gtp_sendto(xact->gnode, pkbuf));
+    } else {
+        ogs_warn("[%d] %s No Reponse. Give up! "
+                "for step %d type %d peer [%s]:%d",
+                xact->xid,
+                xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+                xact->step, xact->seq[xact->step-1].type,
+                OGS_ADDR(&xact->gnode->addr, buf),
+                OGS_PORT(&xact->gnode->addr));
+
+        if (xact->cb)
+            xact->cb(xact, xact->data);
+
+        ogs_gtp_xact_delete(xact);
+    }
+}
+
+static void holding_timeout(void *data)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_pool_id_t xact_id = OGS_INVALID_POOL_ID;
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(data);
+    xact_id = OGS_POINTER_TO_UINT(data);
+    ogs_assert(xact_id >= OGS_MIN_POOL_ID && xact_id <= OGS_MAX_POOL_ID);
+
+    xact = ogs_gtp_xact_find_by_id(xact_id);
+    if (!xact) {
+        ogs_error("GTP Transaction has already been removed [%d]", xact_id);
+        return;;
+    }
+    ogs_assert(xact->gnode);
+
+    ogs_debug("[%d] %s Holding Timeout "
+            "for step %d type %d peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            xact->step, xact->seq[xact->step-1].type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    if (--xact->holding_rcount > 0) {
+        if (xact->tm_holding)
+            ogs_timer_start(xact->tm_holding,
+                    ogs_local_conf()->time.message.gtp.t3_holding_duration);
+    } else {
+        ogs_debug("[%d] %s Delete Transaction "
+                "for step %d type %d peer [%s]:%d",
+                xact->xid,
+                xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+                xact->step, xact->seq[xact->step-1].type,
+                OGS_ADDR(&xact->gnode->addr, buf),
+                OGS_PORT(&xact->gnode->addr));
+        ogs_gtp_xact_delete(xact);
+    }
+}
+
+static void peer_timeout(void *data)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_pool_id_t xact_id = OGS_INVALID_POOL_ID;
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(data);
+    xact_id = OGS_POINTER_TO_UINT(data);
+    ogs_assert(xact_id >= OGS_MIN_POOL_ID && xact_id <= OGS_MAX_POOL_ID);
+
+    xact = ogs_gtp_xact_find_by_id(xact_id);
+    if (!xact) {
+        ogs_error("GTP Transaction has already been removed [%d]", xact_id);
+        return;;
+    }
+    ogs_assert(xact->gnode);
+
+    ogs_error("[%d] %s Peer Timeout "
+            "for step %d type %d peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            xact->step, xact->seq[xact->step-1].type,
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    if (xact->peer_cb)
+        xact->peer_cb(xact, xact->peer_data);
+}
+
+int ogs_gtp1_xact_receive(
+        ogs_gtp_node_t *gnode, ogs_gtp1_header_t *h, ogs_gtp_xact_t **xact)
+{
+    int rv;
+    char buf[OGS_ADDRSTRLEN];
+
+    uint8_t type;
+    uint32_t sqn, xid;
+    ogs_gtp_xact_stage_t stage;
+    ogs_list_t *list = NULL;
+    ogs_gtp_xact_t *new = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(h);
+
+    type = h->type;
+
+    if (!h->s) {
+        ogs_error("ogs_gtp_xact_update_rx() failed, pkt has no SQN");
+        return OGS_ERROR;
+    }
+    sqn = h->sqn;
+
+    xid = OGS_GTP1_SQN_TO_XID(sqn);
+    stage = ogs_gtp1_xact_get_stage(type, xid);
+
+    switch (stage) {
+    case GTP_XACT_INITIAL_STAGE:
+        list = &gnode->remote_list;
+        break;
+    case GTP_XACT_INTERMEDIATE_STAGE:
+        list = &gnode->local_list;
+        break;
+    case GTP_XACT_FINAL_STAGE:
+        /* For types which are replies to replies, the xact is never locally
+         * created during transmit, but actually during rx of the initial req, hence
+         * it is never placed in the local_list, but in the remote_list. */
+        if (type == OGS_GTP1_SGSN_CONTEXT_ACKNOWLEDGE_TYPE)
+            list = &gnode->remote_list;
+        else
+            list = &gnode->local_list;
+        break;
+    default:
+        ogs_error("[%d] Unexpected type %u from GTPv1 peer [%s]:%d",
+                xid, type, OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr));
+        return OGS_ERROR;
+    }
+
+    ogs_assert(list);
+    ogs_list_for_each(list, new) {
+        if (new->gtp_version == 1 && new->xid == xid) {
+            ogs_debug("[%d] %s Find GTPv%u peer [%s]:%d",
+                    new->xid,
+                    new->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+                    new->gtp_version,
+                    OGS_ADDR(&gnode->addr, buf),
+                    OGS_PORT(&gnode->addr));
+            break;
+        }
+    }
+
+    if (!new) {
+        ogs_debug("[%d] Cannot find xact type %u from GTPv1 peer [%s]:%d",
+                  xid, type, OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr));
+        new = ogs_gtp_xact_remote_create(gnode, 1, sqn);
+    }
+    ogs_assert(new);
+
+    ogs_debug("[%d] %s Receive peer [%s]:%d",
+            new->xid,
+            new->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            OGS_ADDR(&gnode->addr, buf),
+            OGS_PORT(&gnode->addr));
+
+    rv = ogs_gtp_xact_update_rx(new, type);
+    if (rv == OGS_ERROR) {
+        ogs_error("ogs_gtp_xact_update_rx() failed");
+        ogs_gtp_xact_delete(new);
+        return rv;
+    } else if (rv == OGS_RETRY) {
+        return rv;
+    }
+
+    *xact = new;
+    return rv;
+}
+
+int ogs_gtp_xact_receive(
+        ogs_gtp_node_t *gnode, ogs_gtp2_header_t *h, ogs_gtp_xact_t **xact)
+{
+    int rv;
+    char buf[OGS_ADDRSTRLEN];
+
+    uint8_t type;
+    uint32_t sqn, xid;
+    ogs_gtp_xact_stage_t stage;
+    ogs_list_t *list = NULL;
+    ogs_gtp_xact_t *new = NULL;
+
+    ogs_assert(gnode);
+    ogs_assert(h);
+
+    type = h->type;
+
+    if (h->teid_presence) sqn = h->sqn;
+    else sqn = h->sqn_only;
+
+    xid = OGS_GTP2_SQN_TO_XID(sqn);
+    stage = ogs_gtp2_xact_get_stage(type, xid);
+
+    switch (stage) {
+    case GTP_XACT_INITIAL_STAGE:
+        list = &gnode->remote_list;
+        break;
+    case GTP_XACT_INTERMEDIATE_STAGE:
+        list = &gnode->local_list;
+        break;
+    case GTP_XACT_FINAL_STAGE:
+        if (xid & OGS_GTP_CMD_XACT_ID) {
+            if (type == OGS_GTP2_MODIFY_BEARER_FAILURE_INDICATION_TYPE ||
+                type == OGS_GTP2_DELETE_BEARER_FAILURE_INDICATION_TYPE ||
+                type == OGS_GTP2_BEARER_RESOURCE_FAILURE_INDICATION_TYPE) {
+                list = &gnode->local_list;
+            } else {
+                list = &gnode->remote_list;
+            }
+        } else {
+            list = &gnode->local_list;
+        }
+        break;
+    default:
+        ogs_error("[%d] Unexpected type %u from GTPv2 peer [%s]:%d",
+                xid, type, OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr));
+        return OGS_ERROR;
+    }
+
+    ogs_assert(list);
+    ogs_list_for_each(list, new) {
+        if (new->gtp_version == 2 && new->xid == xid) {
+            ogs_debug("[%d] %s Find GTPv%u peer [%s]:%d",
+                    new->xid,
+                    new->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+                    new->gtp_version,
+                    OGS_ADDR(&gnode->addr, buf),
+                    OGS_PORT(&gnode->addr));
+            break;
+        }
+    }
+
+    if (!new) {
+        ogs_debug("[%d] Cannot find xact type %u from GTPv2 peer [%s]:%d",
+                  xid, type, OGS_ADDR(&gnode->addr, buf), OGS_PORT(&gnode->addr));
+        new = ogs_gtp_xact_remote_create(gnode, 2, sqn);
+    }
+    ogs_assert(new);
+
+    ogs_debug("[%d] %s Receive peer [%s]:%d",
+            new->xid,
+            new->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            OGS_ADDR(&gnode->addr, buf),
+            OGS_PORT(&gnode->addr));
+
+    rv = ogs_gtp_xact_update_rx(new, type);
+    if (rv == OGS_ERROR) {
+        ogs_error("ogs_gtp_xact_update_rx() failed");
+        ogs_gtp_xact_delete(new);
+        return rv;
+    } else if (rv == OGS_RETRY) {
+        return rv;
+    }
+
+    *xact = new;
+    return rv;
+}
+
+static ogs_gtp_xact_stage_t ogs_gtp1_xact_get_stage(uint8_t type, uint32_t xid)
+{
+    ogs_gtp_xact_stage_t stage = GTP_XACT_UNKNOWN_STAGE;
+
+    switch (type) {
+    case OGS_GTP1_ECHO_REQUEST_TYPE:
+    case OGS_GTP1_NODE_ALIVE_REQUEST_TYPE:
+    case OGS_GTP1_REDIRECTION_REQUEST_TYPE:
+    case OGS_GTP1_CREATE_PDP_CONTEXT_REQUEST_TYPE:
+    case OGS_GTP1_UPDATE_PDP_CONTEXT_REQUEST_TYPE:
+    case OGS_GTP1_DELETE_PDP_CONTEXT_REQUEST_TYPE:
+    case OGS_GTP1_INITIATE_PDP_CONTEXT_ACTIVATION_REQUEST_TYPE:
+    case OGS_GTP1_PDU_NOTIFICATION_REQUEST_TYPE:
+    case OGS_GTP1_PDU_NOTIFICATION_REJECT_REQUEST_TYPE:
+    case OGS_GTP1_SEND_ROUTEING_INFORMATION_FOR_GPRS_REQUEST_TYPE:
+    case OGS_GTP1_FAILURE_REPORT_REQUEST_TYPE:
+    case OGS_GTP1_NOTE_MS_GPRS_PRESENT_REQUEST_TYPE:
+    case OGS_GTP1_IDENTIFICATION_REQUEST_TYPE:
+    case OGS_GTP1_SGSN_CONTEXT_REQUEST_TYPE:
+    case OGS_GTP1_FORWARD_RELOCATION_REQUEST_TYPE:
+    case OGS_GTP1_RELOCATION_CANCEL_REQUEST_TYPE:
+    case OGS_GTP1_UE_REGISTRATION_QUERY_REQUEST_TYPE:
+    case OGS_GTP1_RAN_INFORMATION_RELAY_TYPE:
+        stage = GTP_XACT_INITIAL_STAGE;
+        break;
+    case OGS_GTP1_SGSN_CONTEXT_RESPONSE_TYPE:
+        stage = GTP_XACT_INTERMEDIATE_STAGE;
+        break;
+    case OGS_GTP1_ECHO_RESPONSE_TYPE:
+    case OGS_GTP1_NODE_ALIVE_RESPONSE_TYPE:
+    case OGS_GTP1_REDIRECTION_RESPONSE_TYPE:
+    case OGS_GTP1_CREATE_PDP_CONTEXT_RESPONSE_TYPE:
+    case OGS_GTP1_UPDATE_PDP_CONTEXT_RESPONSE_TYPE:
+    case OGS_GTP1_DELETE_PDP_CONTEXT_RESPONSE_TYPE:
+    case OGS_GTP1_INITIATE_PDP_CONTEXT_ACTIVATION_RESPONSE_TYPE:
+    case OGS_GTP1_PDU_NOTIFICATION_RESPONSE_TYPE:
+    case OGS_GTP1_PDU_NOTIFICATION_REJECT_RESPONSE_TYPE:
+    case OGS_GTP1_SEND_ROUTEING_INFORMATION_FOR_GPRS_RESPONSE_TYPE:
+    case OGS_GTP1_FAILURE_REPORT_RESPONSE_TYPE:
+    case OGS_GTP1_NOTE_MS_GPRS_PRESENT_RESPONSE_TYPE:
+    case OGS_GTP1_IDENTIFICATION_RESPONSE_TYPE:
+    case OGS_GTP1_SGSN_CONTEXT_ACKNOWLEDGE_TYPE:
+    case OGS_GTP1_FORWARD_RELOCATION_RESPONSE_TYPE:
+    case OGS_GTP1_RELOCATION_CANCEL_RESPONSE_TYPE:
+    case OGS_GTP1_UE_REGISTRATION_QUERY_RESPONSE_TYPE:
+        stage = GTP_XACT_FINAL_STAGE;
+        break;
+
+    default:
+        ogs_error("Not implemented GTPv1 Message Type(%d)", type);
+        break;
+    }
+
+    return stage;
+}
+
+/* TS 29.274 Table 6.1-1 */
+static ogs_gtp_xact_stage_t ogs_gtp2_xact_get_stage(uint8_t type, uint32_t xid)
+{
+    ogs_gtp_xact_stage_t stage = GTP_XACT_UNKNOWN_STAGE;
+
+    switch (type) {
+    case OGS_GTP2_ECHO_REQUEST_TYPE:
+    case OGS_GTP2_CREATE_SESSION_REQUEST_TYPE:
+    case OGS_GTP2_MODIFY_BEARER_REQUEST_TYPE:
+    case OGS_GTP2_DELETE_SESSION_REQUEST_TYPE:
+    case OGS_GTP2_CHANGE_NOTIFICATION_REQUEST_TYPE:
+    case OGS_GTP2_REMOTE_UE_REPORT_NOTIFICATION_TYPE:
+    case OGS_GTP2_MODIFY_BEARER_COMMAND_TYPE:
+    case OGS_GTP2_DELETE_BEARER_COMMAND_TYPE:
+    case OGS_GTP2_BEARER_RESOURCE_COMMAND_TYPE:
+    case OGS_GTP2_TRACE_SESSION_ACTIVATION_TYPE:
+    case OGS_GTP2_TRACE_SESSION_DEACTIVATION_TYPE:
+    case OGS_GTP2_STOP_PAGING_INDICATION_TYPE:
+    case OGS_GTP2_DELETE_PDN_CONNECTION_SET_REQUEST_TYPE:
+    case OGS_GTP2_PGW_DOWNLINK_TRIGGERING_NOTIFICATION_TYPE:
+    case OGS_GTP2_CREATE_FORWARDING_TUNNEL_REQUEST_TYPE:
+    case OGS_GTP2_SUSPEND_NOTIFICATION_TYPE:
+    case OGS_GTP2_RESUME_NOTIFICATION_TYPE:
+    case OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE:
+    case OGS_GTP2_DELETE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE:
+    case OGS_GTP2_RELEASE_ACCESS_BEARERS_REQUEST_TYPE:
+    case OGS_GTP2_DOWNLINK_DATA_NOTIFICATION_TYPE:
+    case OGS_GTP2_PGW_RESTART_NOTIFICATION_TYPE:
+    case OGS_GTP2_UPDATE_PDN_CONNECTION_SET_REQUEST_TYPE:
+    case OGS_GTP2_MODIFY_ACCESS_BEARERS_REQUEST_TYPE:
+        stage = GTP_XACT_INITIAL_STAGE;
+        break;
+    case OGS_GTP2_CREATE_BEARER_REQUEST_TYPE:
+    case OGS_GTP2_UPDATE_BEARER_REQUEST_TYPE:
+    case OGS_GTP2_DELETE_BEARER_REQUEST_TYPE:
+        if (xid & OGS_GTP_CMD_XACT_ID)
+            stage = GTP_XACT_INTERMEDIATE_STAGE;
+        else
+            stage = GTP_XACT_INITIAL_STAGE;
+        break;
+    case OGS_GTP2_ECHO_RESPONSE_TYPE:
+    case OGS_GTP2_VERSION_NOT_SUPPORTED_INDICATION_TYPE:
+    case OGS_GTP2_CREATE_SESSION_RESPONSE_TYPE:
+    case OGS_GTP2_MODIFY_BEARER_RESPONSE_TYPE:
+    case OGS_GTP2_DELETE_SESSION_RESPONSE_TYPE:
+    case OGS_GTP2_CHANGE_NOTIFICATION_RESPONSE_TYPE:
+    case OGS_GTP2_REMOTE_UE_REPORT_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_MODIFY_BEARER_FAILURE_INDICATION_TYPE:
+    case OGS_GTP2_DELETE_BEARER_FAILURE_INDICATION_TYPE:
+    case OGS_GTP2_BEARER_RESOURCE_FAILURE_INDICATION_TYPE:
+    case OGS_GTP2_DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION_TYPE:
+    case OGS_GTP2_CREATE_BEARER_RESPONSE_TYPE:
+    case OGS_GTP2_UPDATE_BEARER_RESPONSE_TYPE:
+    case OGS_GTP2_DELETE_BEARER_RESPONSE_TYPE:
+    case OGS_GTP2_DELETE_PDN_CONNECTION_SET_RESPONSE_TYPE:
+    case OGS_GTP2_PGW_DOWNLINK_TRIGGERING_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_CREATE_FORWARDING_TUNNEL_RESPONSE_TYPE:
+    case OGS_GTP2_SUSPEND_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_RESUME_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_RESPONSE_TYPE:
+    case OGS_GTP2_DELETE_INDIRECT_DATA_FORWARDING_TUNNEL_RESPONSE_TYPE:
+    case OGS_GTP2_RELEASE_ACCESS_BEARERS_RESPONSE_TYPE:
+    case OGS_GTP2_DOWNLINK_DATA_NOTIFICATION_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_PGW_RESTART_NOTIFICATION_ACKNOWLEDGE_TYPE:
+    case OGS_GTP2_UPDATE_PDN_CONNECTION_SET_RESPONSE_TYPE:
+    case OGS_GTP2_MODIFY_ACCESS_BEARERS_RESPONSE_TYPE:
+        stage = GTP_XACT_FINAL_STAGE;
+        break;
+
+    default:
+        ogs_error("Not implemented GTPv2 Message Type(%d)", type);
+        break;
+    }
+
+    return stage;
+}
+
+void ogs_gtp_xact_associate(ogs_gtp_xact_t *xact1, ogs_gtp_xact_t *xact2)
+{
+    ogs_assert(xact1);
+    ogs_assert(xact2);
+
+    ogs_assert(xact1->assoc_xact_id == OGS_INVALID_POOL_ID);
+    ogs_assert(xact2->assoc_xact_id == OGS_INVALID_POOL_ID);
+
+    xact1->assoc_xact_id = xact2->id;
+    xact2->assoc_xact_id = xact1->id;
+}
+
+void ogs_gtp_xact_deassociate(ogs_gtp_xact_t *xact1, ogs_gtp_xact_t *xact2)
+{
+    ogs_assert(xact1);
+    ogs_assert(xact2);
+
+    ogs_assert(xact1->assoc_xact_id != OGS_INVALID_POOL_ID);
+    ogs_assert(xact2->assoc_xact_id != OGS_INVALID_POOL_ID);
+
+    xact1->assoc_xact_id = OGS_INVALID_POOL_ID;
+    xact2->assoc_xact_id = OGS_INVALID_POOL_ID;
+}
+
+static int ogs_gtp_xact_delete(ogs_gtp_xact_t *xact)
+{
+    char buf[OGS_ADDRSTRLEN];
+    ogs_gtp_xact_t *assoc_xact = NULL;
+
+    ogs_assert(xact);
+    ogs_assert(xact->gnode);
+
+    ogs_debug("[%d] %s Delete  peer [%s]:%d",
+            xact->xid,
+            xact->org == OGS_GTP_LOCAL_ORIGINATOR ? "LOCAL " : "REMOTE",
+            OGS_ADDR(&xact->gnode->addr, buf),
+            OGS_PORT(&xact->gnode->addr));
+
+    if (xact->seq[0].pkbuf)
+        ogs_pkbuf_free(xact->seq[0].pkbuf);
+    if (xact->seq[1].pkbuf)
+        ogs_pkbuf_free(xact->seq[1].pkbuf);
+    if (xact->seq[2].pkbuf)
+        ogs_pkbuf_free(xact->seq[2].pkbuf);
+
+    if (xact->tm_response)
+        ogs_timer_delete(xact->tm_response);
+    if (xact->tm_holding)
+        ogs_timer_delete(xact->tm_holding);
+    if (xact->tm_peer)
+        ogs_timer_delete(xact->tm_peer);
+
+    assoc_xact = ogs_gtp_xact_find_by_id(xact->assoc_xact_id);
+    if (assoc_xact)
+        ogs_gtp_xact_deassociate(xact, assoc_xact);
+
+    ogs_list_remove(xact->org == OGS_GTP_LOCAL_ORIGINATOR ?
+            &xact->gnode->local_list : &xact->gnode->remote_list, xact);
+    ogs_pool_id_free(&pool, xact);
+
+    return OGS_OK;
+}
+===== xact.h =====
+/*
+ * Copyright (C) 2019 by Sukchan Lee <acetcom@gmail.com>
+ * Copyright (C) 2022 by sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+ * Copyright (C) 2023 by Sukchan Lee <acetcom@gmail.com>
+ *
+ * This file is part of Open5GS.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#if !defined(OGS_GTP_INSIDE) && !defined(OGS_GTP_COMPILATION)
+#error "This header cannot be included directly."
+#endif
+
+#ifndef OGS_GTP_XACT_H
+#define OGS_GTP_XACT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * p225-226 Chapter 7.6 in TS 29.274 V15.9.0
+ *
+ * A Sequence Number used for a Command message shall have the most significant
+ * bit set to 1. A Sequence Number in a message, which was triggered by
+ * a Command message, as well as respective Triggered Reply message
+ * shall have the same Sequence Number as the Command message
+ * (i.e. shall also have the most significant bit set to 1).
+ *
+ * This setting of the most significant bit of the Sequence Number is done
+ * to avoid potential clashes between the Sequence Number selected for
+ * a Command message, and the Sequence Number selected by a GTPv2 peer
+ * for a Request message, which was not triggered by a Command message.
+ *
+ * A Sequence Number used for a Request message, which was not triggered
+ * by a Command message shall have the most significant bit set to 0.
+ */
+#define OGS_GTP_MIN_XACT_ID             1
+#define OGS_GTP_CMD_XACT_ID             0x800000
+
+#define OGS_GTP1_MIN_XACT_ID             0
+#define OGS_GTP1_MAX_XACT_ID             65535
+
+/**
+ * Transaction context
+ */
+typedef struct ogs_gtp_xact_s {
+    ogs_lnode_t     node;           /**< A node of list */
+
+    ogs_pool_id_t   id;
+
+    /*
+     * Issues #3240
+     *
+     * SMF->SGW-C->MME: First Update Bearer Request
+     * MME->UE:         First Modify EPS bearer context request
+     * SMF->SGW-C->MME: Second Update Bearer Request
+     * MME->UE:         Second Modify EPS bearer context request
+     * UE->MME:         First Modify EPS bearer context accept
+     * MME->SGW-C->SMF: First Update Bearer Response
+     * UE->MME:         Second Modify EPS bearer context accept
+     * MME->SGW-C->SMF: Second Update Bearer Response
+     *
+     * In the above situation, while NAS-ESM messages are exchanged
+     * between the MME and UE, the bearer may have multiple transactions
+     * that need to be managed. to_update_node is used as a node
+     * in the Transaction List related to Update Bearer Request/Response.
+     */
+    ogs_lnode_t     to_update_node;
+
+    ogs_pool_id_t   index;
+
+    uint8_t gtp_version;            /**< 1 or 2 */
+
+#define OGS_GTP_LOCAL_ORIGINATOR  0
+#define OGS_GTP_REMOTE_ORIGINATOR 1
+    uint8_t         org;            /**< Transaction' originator.
+                                         local or remote */
+
+    uint32_t        xid;            /**< Transaction ID */
+    ogs_gtp_node_t  *gnode;         /**< Relevant GTP node context */
+
+    void (*cb)(ogs_gtp_xact_t *, void *); /**< Local timer expiration handler */
+    void            *data;          /**< Transaction Data */
+
+    int             step;           /**< Current step in the sequence.
+                                         1 : Initial
+                                         2 : Triggered
+                                         3 : Triggered-Reply */
+    struct {
+        uint8_t     type;           /**< Message type history */
+        ogs_pkbuf_t *pkbuf;         /**< Packet history */
+    } seq[3];                       /**< history for the each step */
+
+    ogs_timer_t     *tm_response;   /**< Timer waiting for next message */
+    uint8_t         response_rcount;
+    ogs_timer_t     *tm_holding;    /**< Timer waiting for holding message */
+    uint8_t         holding_rcount;
+
+    ogs_timer_t     *tm_peer;       /**< Timer waiting for peer message */
+    void (*peer_cb)(ogs_gtp_xact_t *, void *); /**< timer expiration handler */
+    void            *peer_data;     /**< Peer timeout data */
+
+    uint32_t        local_teid;     /**< Local TEID,
+                                         expected in reply from peer */
+
+    ogs_pool_id_t   assoc_xact_id;  /**< Associated GTP transaction ID */
+    void            *pfcp_xact;     /**< Associated PFCP transaction */
+
+    ogs_pool_id_t   enb_ue_id;
+
+#define OGS_GTP_MODIFY_TFT_UPDATE ((uint64_t)1<<0)
+#define OGS_GTP_MODIFY_QOS_UPDATE ((uint64_t)1<<1)
+    uint64_t        update_flags;
+
+#define OGS_GTP_DELETE_NO_ACTION                                1
+#define OGS_GTP_DELETE_SEND_AUTHENTICATION_REQUEST              2
+#define OGS_GTP_DELETE_SEND_DETACH_ACCEPT                       3
+#define OGS_GTP_DELETE_SEND_DEACTIVATE_BEARER_CONTEXT_REQUEST   4
+#define OGS_GTP_DELETE_SEND_RELEASE_WITH_UE_CONTEXT_REMOVE      5
+#define OGS_GTP_DELETE_SEND_RELEASE_WITH_S1_REMOVE_AND_UNLINK   6
+#define OGS_GTP_DELETE_HANDLE_PDN_CONNECTIVITY_REQUEST          7
+#define OGS_GTP_DELETE_IN_PATH_SWITCH_REQUEST                   8
+
+    int             delete_action;
+
+#define OGS_GTP_RELEASE_SEND_UE_CONTEXT_RELEASE_COMMAND     1
+#define OGS_GTP_RELEASE_S1_CONTEXT_REMOVE_BY_LO_CONNREFUSED 2
+#define OGS_GTP_RELEASE_S1_CONTEXT_REMOVE_BY_RESET_ALL      3
+#define OGS_GTP_RELEASE_S1_CONTEXT_REMOVE_BY_RESET_PARTIAL  4
+    int             release_action;
+
+#define OGS_GTP_DELETE_INDIRECT_HANDOVER_COMPLETE 1
+#define OGS_GTP_DELETE_INDIRECT_HANDOVER_CANCEL 2
+    int             delete_indirect_action;
+
+#define OGS_GTP_CREATE_IN_ATTACH_REQUEST 1
+#define OGS_GTP_CREATE_IN_UPLINK_NAS_TRANSPORT 2
+#define OGS_GTP_CREATE_IN_PATH_SWITCH_REQUEST 3
+#define OGS_GTP_CREATE_IN_TRACKING_AREA_UPDATE 4 /* 3GPP TS 33.401 9.1.2 */
+    int             create_action;
+
+#define OGS_GTP_MODIFY_IN_PATH_SWITCH_REQUEST 1
+#define OGS_GTP_MODIFY_IN_E_RAB_MODIFICATION 2
+    int             modify_action;
+} ogs_gtp_xact_t;
+
+int ogs_gtp_xact_init(void);
+void ogs_gtp_xact_final(void);
+
+ogs_gtp_xact_t *ogs_gtp1_xact_local_create(ogs_gtp_node_t *gnode,
+        ogs_gtp1_header_t *hdesc, ogs_pkbuf_t *pkbuf,
+        void (*cb)(ogs_gtp_xact_t *xact, void *data), void *data);
+ogs_gtp_xact_t *ogs_gtp_xact_local_create(ogs_gtp_node_t *gnode,
+        ogs_gtp2_header_t *hdesc, ogs_pkbuf_t *pkbuf,
+        void (*cb)(ogs_gtp_xact_t *xact, void *data), void *data);
+
+ogs_gtp_xact_t *ogs_gtp_xact_find_by_id(ogs_pool_id_t id);
+void ogs_gtp_xact_delete_all(ogs_gtp_node_t *gnode);
+
+int ogs_gtp1_xact_update_tx(ogs_gtp_xact_t *xact,
+        ogs_gtp1_header_t *hdesc, ogs_pkbuf_t *pkbuf);
+int ogs_gtp_xact_update_tx(ogs_gtp_xact_t *xact,
+        ogs_gtp2_header_t *hdesc, ogs_pkbuf_t *pkbuf);
+
+int ogs_gtp_xact_commit(ogs_gtp_xact_t *xact);
+
+int ogs_gtp1_xact_receive(ogs_gtp_node_t *gnode,
+        ogs_gtp1_header_t *h, ogs_gtp_xact_t **xact);
+int ogs_gtp_xact_receive(ogs_gtp_node_t *gnode,
+        ogs_gtp2_header_t *h, ogs_gtp_xact_t **xact);
+
+void ogs_gtp_xact_associate(ogs_gtp_xact_t *xact1, ogs_gtp_xact_t *xact2);
+void ogs_gtp_xact_deassociate(ogs_gtp_xact_t *xact1, ogs_gtp_xact_t *xact2);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OGS_GTP_XACT_H */

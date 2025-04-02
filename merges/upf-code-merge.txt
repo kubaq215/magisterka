@@ -1,0 +1,4695 @@
+===== app.c =====
+
+#include "ogs-app.h"
+
+int app_initialize(const char *const argv[])
+{
+    int rv;
+
+    rv = upf_initialize();
+    if (rv != OGS_OK) {
+        ogs_error("Failed to initialize UPF");
+        return rv;
+    }
+    ogs_info("UPF initialize...done");
+
+    return OGS_OK;
+}
+
+void app_terminate(void)
+{
+    upf_terminate();
+    ogs_info("UPF terminate...done");
+}
+===== arp-nd.cpp =====
+
+#include <cstdint>
+
+#include <tins/arp.h>
+#include <tins/ethernetII.h>
+#include <tins/hw_address.h>
+#include <tins/icmpv6.h>
+#include <tins/exceptions.h>
+
+#include "arp-nd.h"
+
+using namespace::Tins;
+
+
+uint8_t _serialize_reply(uint8_t *reply_data, EthernetII &reply)
+{
+    PDU::serialization_type serialized = reply.serialize();
+    memcpy(reply_data, serialized.data(), serialized.size());
+    return serialized.size();
+}
+
+bool _parse_arp(EthernetII &pdu)
+{
+    if (pdu.payload_type() == ETHERTYPE_ARP) {
+        const ARP& arp = pdu.rfind_pdu<ARP>();
+        return arp.opcode() == ARP::REQUEST && pdu.dst_addr().is_broadcast();
+    }
+    return false;
+}
+
+bool is_arp_req(uint8_t *data, uint len)
+{
+    EthernetII pdu(data, len);
+    return _parse_arp(pdu);
+}
+
+uint32_t arp_parse_target_addr(uint8_t *data, uint len)
+{
+    EthernetII pdu(data, len);
+    if (pdu.payload_type() == ETHERTYPE_ARP) {
+        const ARP& arp = pdu.rfind_pdu<ARP>();
+        return arp.target_ip_addr();
+    }
+    return 0x0;
+}
+
+uint8_t arp_reply(uint8_t *reply_data, uint8_t *request_data, uint len,
+        const uint8_t *mac)
+{
+    EthernetII pdu(request_data, len);
+    if (_parse_arp(pdu)) {
+        HWAddress<ETHER_ADDR_LEN> source_mac(mac);
+        const ARP& arp = pdu.rfind_pdu<ARP>();
+        EthernetII reply = ARP::make_arp_reply(
+            arp.sender_ip_addr(),
+            arp.target_ip_addr(),
+            arp.sender_hw_addr(),
+            source_mac);
+        return _serialize_reply(reply_data, reply);
+    }
+    return 0;
+}
+
+bool _parse_nd(EthernetII &pdu)
+{
+    if (pdu.payload_type() == ETHERTYPE_IPV6) {
+        try {
+            const ICMPv6& icmp6 = pdu.rfind_pdu<ICMPv6>();
+            return icmp6.type() == ICMPv6::NEIGHBOUR_SOLICIT;
+        }
+        catch (Tins::pdu_not_found& e) {
+            /* If it is not an ICMPv6 message, it can not be a NEIGHBOUR_SOLICIT */
+            return false;
+        }
+    }
+    return false;
+}
+
+bool is_nd_req(uint8_t *data, uint len)
+{
+    if (len < MAX_ND_SIZE) {
+        EthernetII pdu(data, len);
+        return _parse_nd(pdu);
+    }
+    return false;
+}
+
+uint8_t nd_reply(uint8_t *reply_data, uint8_t *request_data, uint len,
+        const uint8_t *mac)
+{
+    EthernetII pdu(request_data, len);
+    if (_parse_nd(pdu)) {
+        HWAddress<ETHER_ADDR_LEN> source_mac(mac);
+        const ICMPv6& icmp6 = pdu.rfind_pdu<ICMPv6>();
+        EthernetII reply(pdu.src_addr(), pdu.dst_addr());
+        ICMPv6 nd_reply(ICMPv6::NEIGHBOUR_ADVERT);
+        nd_reply.target_link_layer_addr(source_mac);
+        nd_reply.target_addr(icmp6.target_addr());
+        reply /= nd_reply;
+        return _serialize_reply(reply_data, reply);
+    }
+    return 0;
+}
+===== arp-nd.h =====
+
+#include "upf-config.h"
+
+#ifdef HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
+
+#ifdef HAVE_NETINET_IN_H
+#include <netinet/in.h>
+#endif
+
+#ifdef HAVE_NET_ETHERNET_H
+#include <net/ethernet.h>
+#endif
+
+#define MAX_ND_SIZE 128
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void set_source_mac(uint8_t *data);
+bool is_arp_req(uint8_t *data, uint len);
+uint32_t arp_parse_target_addr(uint8_t *data, uint len);
+uint8_t arp_reply(uint8_t *reply_data, uint8_t *request_data, uint len,
+        const uint8_t *mac);
+bool is_nd_req(uint8_t *data, uint len);
+uint8_t nd_reply(uint8_t *reply_data, uint8_t *request_data, uint len,
+        const uint8_t *mac);
+
+#ifdef __cplusplus
+}
+#endif
+===== context.c =====
+
+#include "context.h"
+#include "pfcp-path.h"
+
+static upf_context_t self;
+
+int __upf_log_domain;
+
+static OGS_POOL(upf_sess_pool, upf_sess_t);
+static OGS_POOL(upf_n4_seid_pool, ogs_pool_id_t);
+
+static int context_initialized = 0;
+
+static void upf_sess_urr_acc_remove_all(upf_sess_t *sess);
+
+void upf_context_init(void)
+{
+    ogs_assert(context_initialized == 0);
+
+    /* Initialize UPF context */
+    memset(&self, 0, sizeof(upf_context_t));
+
+    ogs_log_install_domain(&__upf_log_domain, "upf", ogs_core()->log.level);
+
+    /* Setup UP Function Features */
+    ogs_pfcp_self()->up_function_features.ftup = 1;
+    ogs_pfcp_self()->up_function_features.empu = 1;
+    ogs_pfcp_self()->up_function_features.mnop = 1;
+    ogs_pfcp_self()->up_function_features.vtime = 1;
+    ogs_pfcp_self()->up_function_features.frrt = 1;
+    ogs_pfcp_self()->up_function_features_len = 4;
+
+    ogs_list_init(&self.sess_list);
+    ogs_pool_init(&upf_sess_pool, ogs_app()->pool.sess);
+    ogs_pool_init(&upf_n4_seid_pool, ogs_app()->pool.sess);
+    ogs_pool_random_id_generate(&upf_n4_seid_pool);
+
+    self.upf_n4_seid_hash = ogs_hash_make();
+    ogs_assert(self.upf_n4_seid_hash);
+    self.smf_n4_seid_hash = ogs_hash_make();
+    ogs_assert(self.smf_n4_seid_hash);
+    self.smf_n4_f_seid_hash = ogs_hash_make();
+    ogs_assert(self.smf_n4_f_seid_hash);
+    self.ipv4_hash = ogs_hash_make();
+    ogs_assert(self.ipv4_hash);
+    self.ipv6_hash = ogs_hash_make();
+    ogs_assert(self.ipv6_hash);
+
+    context_initialized = 1;
+}
+
+static void free_upf_route_trie_node(struct upf_route_trie_node *node)
+{
+    if (!node)
+        return;
+    free_upf_route_trie_node(node->left);
+    free_upf_route_trie_node(node->right);
+    ogs_free(node);
+}
+
+void upf_context_final(void)
+{
+    ogs_assert(context_initialized == 1);
+
+    upf_sess_remove_all();
+
+    ogs_assert(self.upf_n4_seid_hash);
+    ogs_hash_destroy(self.upf_n4_seid_hash);
+    ogs_assert(self.smf_n4_seid_hash);
+    ogs_hash_destroy(self.smf_n4_seid_hash);
+    ogs_assert(self.smf_n4_f_seid_hash);
+    ogs_hash_destroy(self.smf_n4_f_seid_hash);
+    ogs_assert(self.ipv4_hash);
+    ogs_hash_destroy(self.ipv4_hash);
+    ogs_assert(self.ipv6_hash);
+    ogs_hash_destroy(self.ipv6_hash);
+
+    free_upf_route_trie_node(self.ipv4_framed_routes);
+    free_upf_route_trie_node(self.ipv6_framed_routes);
+
+    ogs_pool_final(&upf_sess_pool);
+    ogs_pool_final(&upf_n4_seid_pool);
+
+    context_initialized = 0;
+}
+
+upf_context_t *upf_self(void)
+{
+    return &self;
+}
+
+static int upf_context_prepare(void)
+{
+    return OGS_OK;
+}
+
+static int upf_context_validation(void)
+{
+    if (ogs_list_first(&ogs_gtp_self()->gtpu_list) == NULL) {
+        ogs_error("No upf.gtpu.address in '%s'", ogs_app()->file);
+        return OGS_ERROR;
+    }
+    if (ogs_list_first(&ogs_pfcp_self()->subnet_list) == NULL) {
+        ogs_error("No upf.session.subnet: in '%s'", ogs_app()->file);
+        return OGS_ERROR;
+    }
+    return OGS_OK;
+}
+
+int upf_context_parse_config(void)
+{
+    int rv;
+    yaml_document_t *document = NULL;
+    ogs_yaml_iter_t root_iter;
+    int idx = 0;
+
+    document = ogs_app()->document;
+    ogs_assert(document);
+
+    rv = upf_context_prepare();
+    if (rv != OGS_OK) return rv;
+
+    ogs_yaml_iter_init(&root_iter, document);
+    while (ogs_yaml_iter_next(&root_iter)) {
+        const char *root_key = ogs_yaml_iter_key(&root_iter);
+        ogs_assert(root_key);
+        if ((!strcmp(root_key, "upf")) &&
+            (idx++ == ogs_app()->config_section_id)) {
+            ogs_yaml_iter_t upf_iter;
+            ogs_yaml_iter_recurse(&root_iter, &upf_iter);
+            while (ogs_yaml_iter_next(&upf_iter)) {
+                const char *upf_key = ogs_yaml_iter_key(&upf_iter);
+                ogs_assert(upf_key);
+                if (!strcmp(upf_key, "gtpu")) {
+                    /* handle config in gtp library */
+                } else if (!strcmp(upf_key, "pfcp")) {
+                    /* handle config in pfcp library */
+                } else if (!strcmp(upf_key, "smf")) {
+                    /* handle config in pfcp library */
+                } else if (!strcmp(upf_key, "session")) {
+                    /* handle config in pfcp library */
+                } else if (!strcmp(upf_key, "metrics")) {
+                    /* handle config in metrics library */
+                } else
+                    ogs_warn("unknown key `%s`", upf_key);
+            }
+        }
+    }
+
+    rv = upf_context_validation();
+    if (rv != OGS_OK) return rv;
+
+    return OGS_OK;
+}
+
+upf_sess_t *upf_sess_add(ogs_pfcp_f_seid_t *cp_f_seid)
+{
+    upf_sess_t *sess = NULL;
+
+    ogs_assert(cp_f_seid);
+
+    ogs_pool_id_calloc(&upf_sess_pool, &sess);
+    ogs_assert(sess);
+
+    ogs_pfcp_pool_init(&sess->pfcp);
+
+    /* Set UPF-N4-SEID */
+    ogs_pool_alloc(&upf_n4_seid_pool, &sess->upf_n4_seid_node);
+    ogs_assert(sess->upf_n4_seid_node);
+
+    sess->upf_n4_seid = *(sess->upf_n4_seid_node);
+
+    ogs_hash_set(self.upf_n4_seid_hash, &sess->upf_n4_seid,
+            sizeof(sess->upf_n4_seid), sess);
+
+    /* Since F-SEID is composed of ogs_ip_t and uint64-seid,
+     * all these values must be put into the structure-smf_n4_f_seid
+     * before creating hash */
+    sess->smf_n4_f_seid.seid = cp_f_seid->seid;
+    ogs_assert(OGS_OK ==
+            ogs_pfcp_f_seid_to_ip(cp_f_seid, &sess->smf_n4_f_seid.ip));
+
+    ogs_hash_set(self.smf_n4_f_seid_hash, &sess->smf_n4_f_seid,
+            sizeof(sess->smf_n4_f_seid), sess);
+    ogs_hash_set(self.smf_n4_seid_hash, &sess->smf_n4_f_seid.seid,
+            sizeof(sess->smf_n4_f_seid.seid), sess);
+
+    ogs_list_add(&self.sess_list, sess);
+    upf_metrics_inst_global_inc(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
+
+    ogs_info("[Added] Number of UPF-Sessions is now %d",
+            ogs_list_count(&self.sess_list));
+
+    return sess;
+}
+
+int upf_sess_remove(upf_sess_t *sess)
+{
+    ogs_assert(sess);
+
+    upf_sess_urr_acc_remove_all(sess);
+
+    ogs_list_remove(&self.sess_list, sess);
+    ogs_pfcp_sess_clear(&sess->pfcp);
+
+    ogs_hash_set(self.upf_n4_seid_hash, &sess->upf_n4_seid,
+            sizeof(sess->upf_n4_seid), NULL);
+
+    ogs_hash_set(self.smf_n4_seid_hash, &sess->smf_n4_f_seid.seid,
+            sizeof(sess->smf_n4_f_seid.seid), NULL);
+    ogs_hash_set(self.smf_n4_f_seid_hash, &sess->smf_n4_f_seid,
+            sizeof(sess->smf_n4_f_seid), NULL);
+
+    if (sess->ipv4) {
+        ogs_hash_set(self.ipv4_hash, sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        ogs_pfcp_ue_ip_free(sess->ipv4);
+    }
+    if (sess->ipv6) {
+        ogs_hash_set(self.ipv6_hash,
+                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        ogs_pfcp_ue_ip_free(sess->ipv6);
+    }
+
+    upf_sess_set_ue_ipv4_framed_routes(sess, NULL);
+    upf_sess_set_ue_ipv6_framed_routes(sess, NULL);
+
+    ogs_pfcp_pool_final(&sess->pfcp);
+
+    ogs_pool_free(&upf_n4_seid_pool, sess->upf_n4_seid_node);
+    ogs_pool_id_free(&upf_sess_pool, sess);
+    if (sess->apn_dnn)
+        ogs_free(sess->apn_dnn);
+    upf_metrics_inst_global_dec(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
+
+    ogs_info("[Removed] Number of UPF-sessions is now %d",
+            ogs_list_count(&self.sess_list));
+
+    return OGS_OK;
+}
+
+void upf_sess_remove_all(void)
+{
+    upf_sess_t *sess = NULL, *next = NULL;
+
+    ogs_list_for_each_safe(&self.sess_list, next, sess) {
+        upf_sess_remove(sess);
+    }
+}
+
+upf_sess_t *upf_sess_find_by_smf_n4_seid(uint64_t seid)
+{
+    return ogs_hash_get(self.smf_n4_seid_hash, &seid, sizeof(seid));
+}
+
+upf_sess_t *upf_sess_find_by_smf_n4_f_seid(ogs_pfcp_f_seid_t *f_seid)
+{
+    struct {
+        uint64_t seid;
+        ogs_ip_t ip;
+    } key;
+
+    ogs_assert(f_seid);
+    ogs_assert(OGS_OK == ogs_pfcp_f_seid_to_ip(f_seid, &key.ip));
+    key.seid = f_seid->seid;
+
+    return ogs_hash_get(self.smf_n4_f_seid_hash, &key, sizeof(key));
+}
+
+upf_sess_t *upf_sess_find_by_upf_n4_seid(uint64_t seid)
+{
+    return ogs_hash_get(self.upf_n4_seid_hash, &seid, sizeof(seid));
+}
+
+upf_sess_t *upf_sess_find_by_ipv4(uint32_t addr)
+{
+    upf_sess_t *ret;
+    struct upf_route_trie_node *trie = self.ipv4_framed_routes;
+    const int nbits = sizeof(addr) << 3;
+    int i;
+
+    ogs_assert(self.ipv4_hash);
+
+    ret = ogs_hash_get(self.ipv4_hash, &addr, OGS_IPV4_LEN);
+    if (ret)
+        return ret;
+
+    for (i =  0; i <= nbits; i++) {
+        int bit = nbits - i - 1;
+
+        if (!trie)
+            break;
+        if (trie->sess)
+            ret = trie->sess;
+        if (i == nbits)
+            break;
+
+        if ((1 << bit) & be32toh(addr))
+            trie = trie->right;
+        else
+            trie = trie->left;
+    }
+    return ret;
+}
+
+upf_sess_t *upf_sess_find_by_ipv6(uint32_t *addr6)
+{
+    upf_sess_t *ret = NULL;
+    struct upf_route_trie_node *trie = self.ipv6_framed_routes;
+    int i;
+    const int chunk_size = sizeof(*addr6) << 3;
+
+    ogs_assert(self.ipv6_hash);
+    ogs_assert(addr6);
+    ret = ogs_hash_get(
+            self.ipv6_hash, addr6, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
+    if (ret)
+        return ret;
+
+    for (i = 0; i <= OGS_IPV6_128_PREFIX_LEN; i++) {
+        int part = i / chunk_size;
+        int bit = (OGS_IPV6_128_PREFIX_LEN - i - 1) % chunk_size;
+
+        if (!trie)
+            break;
+        if (trie->sess)
+            ret = trie->sess;
+        if (i == OGS_IPV6_128_PREFIX_LEN)
+            break;
+
+        if ((1 << bit) & be32toh(addr6[part]))
+            trie = trie->right;
+        else
+            trie = trie->left;
+    }
+    return ret;
+}
+
+upf_sess_t *upf_sess_find_by_id(ogs_pool_id_t id)
+{
+    return ogs_pool_find_by_id(&upf_sess_pool, id);
+}
+
+upf_sess_t *upf_sess_add_by_message(ogs_pfcp_message_t *message)
+{
+    upf_sess_t *sess = NULL;
+    ogs_pfcp_f_seid_t *f_seid = NULL;
+
+    ogs_pfcp_session_establishment_request_t *req =
+        &message->pfcp_session_establishment_request;;
+
+    f_seid = req->cp_f_seid.data;
+    if (req->cp_f_seid.presence == 0 || f_seid == NULL) {
+        ogs_error("No CP F-SEID");
+        return NULL;
+    }
+    if (f_seid->ipv4 == 0 && f_seid->ipv6 == 0) {
+        ogs_error("No IPv4 or IPv6");
+        return NULL;
+    }
+    f_seid->seid = be64toh(f_seid->seid);
+
+    sess = upf_sess_find_by_smf_n4_f_seid(f_seid);
+    if (!sess) {
+        sess = upf_sess_add(f_seid);
+        if (!sess) {
+            ogs_error("No Session Context");
+            return NULL;
+        }
+    }
+    ogs_assert(sess);
+
+    return sess;
+}
+
+uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
+        uint8_t session_type, ogs_pfcp_pdr_t *pdr)
+{
+    ogs_pfcp_ue_ip_addr_t *ue_ip = NULL;
+    char buf1[OGS_ADDRSTRLEN];
+    char buf2[OGS_ADDRSTRLEN];
+
+    uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    ogs_assert(sess);
+    ogs_assert(pdr);
+    ogs_assert(pdr->ue_ip_addr_len);
+    ue_ip = &pdr->ue_ip_addr;
+    ogs_assert(ue_ip);
+
+    if (sess->ipv4) {
+        ogs_hash_set(self.ipv4_hash,
+                sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+        ogs_pfcp_ue_ip_free(sess->ipv4);
+    }
+    if (sess->ipv6) {
+        ogs_hash_set(self.ipv6_hash,
+                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        ogs_pfcp_ue_ip_free(sess->ipv6);
+    }
+
+    /* Set PDN-Type and UE IP Address */
+    if (session_type == OGS_PDU_SESSION_TYPE_IPV4) {
+        if (ue_ip->ipv4 || pdr->dnn) {
+            sess->ipv4 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET,
+                            pdr->dnn, (uint8_t *)&(ue_ip->addr));
+            if (!sess->ipv4) {
+                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
+                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+                return cause_value;
+            }
+            ogs_hash_set(self.ipv4_hash, sess->ipv4->addr, OGS_IPV4_LEN, sess);
+        } else {
+            ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
+                session_type, ue_ip->ipv4, ue_ip->ipv6,
+                pdr->dnn ? pdr->dnn : "");
+        }
+    } else if (session_type == OGS_PDU_SESSION_TYPE_IPV6) {
+        if (ue_ip->ipv6 || pdr->dnn) {
+            sess->ipv6 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET6,
+                            pdr->dnn, ue_ip->addr6);
+            if (!sess->ipv6) {
+                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
+                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+                return cause_value;
+            }
+            ogs_hash_set(self.ipv6_hash, sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+        } else {
+            ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
+                session_type, ue_ip->ipv4, ue_ip->ipv6,
+                pdr->dnn ? pdr->dnn : "");
+        }
+    } else if (session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
+        if (ue_ip->ipv4 || pdr->dnn) {
+            sess->ipv4 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET,
+                            pdr->dnn, (uint8_t *)&(ue_ip->both.addr));
+            if (!sess->ipv4) {
+                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
+                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+                return cause_value;
+            }
+            ogs_hash_set(self.ipv4_hash, sess->ipv4->addr, OGS_IPV4_LEN, sess);
+        } else {
+            ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
+                session_type, ue_ip->ipv4, ue_ip->ipv6,
+                pdr->dnn ? pdr->dnn : "");
+        }
+
+        if (ue_ip->ipv6 || pdr->dnn) {
+            sess->ipv6 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET6,
+                            pdr->dnn, ue_ip->both.addr6);
+            if (!sess->ipv6) {
+                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
+                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+                if (sess->ipv4) {
+                    ogs_hash_set(self.ipv4_hash,
+                            sess->ipv4->addr, OGS_IPV4_LEN, NULL);
+                    ogs_pfcp_ue_ip_free(sess->ipv4);
+                    sess->ipv4 = NULL;
+                }
+                return cause_value;
+            }
+            ogs_hash_set(self.ipv6_hash, sess->ipv6->addr,
+                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+        } else {
+            ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
+                session_type, ue_ip->ipv4, ue_ip->ipv6,
+                pdr->dnn ? pdr->dnn : "");
+        }
+    } else {
+        ogs_error("Invalid PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
+                session_type, ue_ip->ipv4, ue_ip->ipv6,
+                pdr->dnn ? pdr->dnn : "");
+        return OGS_PFCP_CAUSE_SERVICE_NOT_SUPPORTED;
+    }
+
+    ogs_info("UE F-SEID[UP:0x%lx CP:0x%lx] "
+             "APN[%s] PDN-Type[%d] IPv4[%s] IPv6[%s]",
+        (long)sess->upf_n4_seid, (long)sess->smf_n4_f_seid.seid,
+        pdr->dnn, session_type,
+        sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
+        sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "");
+
+    return cause_value;
+}
+
+/* Remove amd free framed ROUTE from TRIE. It isn't an error if the framed
+   route doesn't exist in TRIE. */
+static void free_framed_route_from_trie(ogs_ipsubnet_t *route)
+{
+    const int chunk_size = sizeof(route->sub[0]) << 3;
+    const int is_ipv4 = route->family == AF_INET;
+    const int nbits = is_ipv4 ? chunk_size : OGS_IPV6_128_PREFIX_LEN;
+    struct upf_route_trie_node **trie =
+        is_ipv4 ? &self.ipv4_framed_routes : &self.ipv6_framed_routes;
+
+    struct upf_route_trie_node **to_free_tries[OGS_IPV6_128_PREFIX_LEN + 1];
+    int free_from = 0;
+    int i = 0;
+
+    for (i = 0; i <= nbits; i++) {
+        int part = i / chunk_size;
+        int bit = (nbits - i - 1) % chunk_size;
+
+        if (!*trie)
+            break;
+        to_free_tries[i] = trie;
+
+        if (i == nbits ||
+            ((1 << bit) & be32toh(route->mask[part])) == 0) {
+            (*trie)->sess = NULL;
+            if ((*trie)->left || (*trie)->right)
+                free_from = i + 1;
+            i++;
+            break;
+        }
+
+        if ((1 << bit) & be32toh(route->sub[part])) {
+            if ((*trie)->left || (*trie)->sess)
+                free_from = i + 1;
+            trie = &(*trie)->right;
+        } else {
+            if ((*trie)->right || (*trie)->sess)
+                free_from = i + 1;
+            trie = &(*trie)->left;
+        }
+    }
+
+    for (i = i - 1; i >= free_from; i--) {
+        trie = to_free_tries[i];
+        ogs_free(*trie);
+        *trie = NULL;
+    }
+}
+
+static void add_framed_route_to_trie(ogs_ipsubnet_t *route, upf_sess_t *sess)
+{
+    const int chunk_size = sizeof(route->sub[0]) << 3;
+    const int is_ipv4 = route->family == AF_INET;
+    const int nbits = is_ipv4 ? chunk_size : OGS_IPV6_128_PREFIX_LEN;
+    struct upf_route_trie_node **trie =
+        is_ipv4 ? &self.ipv4_framed_routes : &self.ipv6_framed_routes;
+    int i = 0;
+
+    for (i = 0; i <= nbits; i++) {
+        int part = i / chunk_size;
+        int bit = (nbits - i - 1) % chunk_size;
+
+        if (!*trie)
+            *trie = ogs_calloc(1, sizeof(**trie));
+
+        if (i == nbits ||
+            ((1 << bit) & be32toh(route->mask[part])) == 0) {
+            (*trie)->sess = sess;
+            break;
+        }
+
+        if ((1 << bit) & be32toh(route->sub[part])) {
+            trie = &(*trie)->right;
+        } else {
+            trie = &(*trie)->left;
+        }
+    }
+}
+
+static int parse_framed_route(ogs_ipsubnet_t *subnet, const char *framed_route)
+{
+    char *mask = ogs_strdup(framed_route);
+    char *addr = strsep(&mask, "/");
+    int rv;
+
+    rv = ogs_ipsubnet(subnet, addr, mask);
+    ogs_free(addr);
+    return rv;
+}
+
+uint8_t upf_sess_set_ue_ipv4_framed_routes(upf_sess_t *sess,
+        char *framed_routes[])
+{
+    int i = 0, j = 0, rv;
+    uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    ogs_assert(sess);
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        if (!sess->ipv4_framed_routes || !sess->ipv4_framed_routes[i].family)
+            break;
+        free_framed_route_from_trie(&sess->ipv4_framed_routes[i]);
+        memset(&sess->ipv4_framed_routes[i], 0,
+               sizeof(sess->ipv4_framed_routes[i]));
+    }
+
+    for (i = 0, j = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        if (!framed_routes || !framed_routes[i])
+            break;
+
+        if (sess->ipv4_framed_routes == NULL) {
+            sess->ipv4_framed_routes = ogs_calloc(
+                OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI, sizeof(ogs_ipsubnet_t));
+            ogs_assert(sess->ipv4_framed_routes);
+        }
+
+        rv = parse_framed_route(&sess->ipv4_framed_routes[j], framed_routes[i]);
+
+        if (rv != OGS_OK) {
+            ogs_warn("Ignoring invalid framed route %s", framed_routes[i]);
+            memset(&sess->ipv4_framed_routes[j], 0,
+                   sizeof(sess->ipv4_framed_routes[j]));
+            continue;
+        }
+        add_framed_route_to_trie(&sess->ipv4_framed_routes[j], sess);
+        j++;
+    }
+    if (j == 0 && sess->ipv4_framed_routes) {
+        ogs_free(sess->ipv4_framed_routes);
+        sess->ipv4_framed_routes = NULL;
+    }
+
+    return cause_value;
+}
+
+uint8_t upf_sess_set_ue_ipv6_framed_routes(upf_sess_t *sess,
+        char *framed_routes[])
+{
+    int i = 0, j = 0, rv;
+    uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    ogs_assert(sess);
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        if (!sess->ipv6_framed_routes || !sess->ipv6_framed_routes[i].family)
+            break;
+        free_framed_route_from_trie(&sess->ipv6_framed_routes[i]);
+    }
+
+    for (i = 0, j = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        if (!framed_routes || !framed_routes[i])
+            break;
+
+        if (sess->ipv6_framed_routes == NULL) {
+            sess->ipv6_framed_routes = ogs_calloc(
+                OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI, sizeof(ogs_ipsubnet_t));
+            ogs_assert(sess->ipv6_framed_routes);
+        }
+
+        rv = parse_framed_route(&sess->ipv6_framed_routes[j], framed_routes[i]);
+
+        if (rv != OGS_OK) {
+            ogs_warn("Ignoring invalid framed route %s", framed_routes[i]);
+            memset(&sess->ipv6_framed_routes[j], 0,
+                   sizeof(sess->ipv6_framed_routes[j]));
+            continue;
+        }
+        add_framed_route_to_trie(&sess->ipv6_framed_routes[j], sess);
+        j++;
+    }
+    if (j == 0 && sess->ipv6_framed_routes) {
+        ogs_free(sess->ipv6_framed_routes);
+        sess->ipv6_framed_routes = NULL;
+    }
+
+    return cause_value;
+}
+
+void upf_sess_urr_acc_add(upf_sess_t *sess, ogs_pfcp_urr_t *urr, size_t size, bool is_uplink)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+    uint64_t vol;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    /* Increment total & ul octets + pkts */
+    urr_acc->total_octets += size;
+    urr_acc->total_pkts++;
+    if (is_uplink) {
+        urr_acc->ul_octets += size;
+        urr_acc->ul_pkts++;
+    } else {
+        urr_acc->dl_octets += size;
+        urr_acc->dl_pkts++;
+    }
+
+    urr_acc->time_of_last_packet = ogs_time_now();
+    if (urr_acc->time_of_first_packet == 0)
+        urr_acc->time_of_first_packet = urr_acc->time_of_last_packet;
+
+    /* generate report if volume threshold/quota is reached */
+    vol = urr_acc->total_octets - urr_acc->last_report.total_octets;
+    if ((urr->rep_triggers.volume_quota && urr->vol_quota.tovol && vol >= urr->vol_quota.total_volume) ||
+        (urr->rep_triggers.volume_threshold && urr->vol_threshold.tovol && vol >= urr->vol_threshold.total_volume)) {
+        ogs_pfcp_user_plane_report_t report;
+        memset(&report, 0, sizeof(report));
+        upf_sess_urr_acc_fill_usage_report(sess, urr, &report, 0);
+        report.num_of_usage_report = 1;
+        upf_sess_urr_acc_snapshot(sess, urr);
+
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_report_request(sess, &report));
+        /* Start new report period/iteration: */
+        upf_sess_urr_acc_timers_setup(sess, urr);
+    }
+}
+
+/* report struct must be memzeroed before first use of this function.
+ * report->num_of_usage_report must be set by the caller */
+void upf_sess_urr_acc_fill_usage_report(upf_sess_t *sess, const ogs_pfcp_urr_t *urr,
+                                  ogs_pfcp_user_plane_report_t *report, unsigned int idx)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+    ogs_time_t last_report_timestamp;
+    ogs_time_t now;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    now = ogs_time_now(); /* we need UTC for start_time and end_time */
+
+    if (urr_acc->last_report.timestamp)
+        last_report_timestamp = urr_acc->last_report.timestamp;
+    else
+        last_report_timestamp = ogs_time_from_ntp32(urr_acc->time_start);
+
+    report->type.usage_report = 1;
+    report->usage_report[idx].id = urr->id;
+    report->usage_report[idx].seqn = urr_acc->report_seqn++;
+    report->usage_report[idx].start_time = urr_acc->time_start;
+    report->usage_report[idx].end_time = ogs_time_to_ntp32(now);
+    report->usage_report[idx].vol_measurement = (ogs_pfcp_volume_measurement_t){
+        .dlnop = 1,
+        .ulnop = 1,
+        .tonop = 1,
+        .dlvol = 1,
+        .ulvol = 1,
+        .tovol = 1,
+        .total_volume = urr_acc->total_octets - urr_acc->last_report.total_octets,
+        .uplink_volume = urr_acc->ul_octets - urr_acc->last_report.ul_octets,
+        .downlink_volume = urr_acc->dl_octets - urr_acc->last_report.dl_octets,
+        .total_n_packets = urr_acc->total_pkts - urr_acc->last_report.total_pkts,
+        .uplink_n_packets = urr_acc->ul_pkts - urr_acc->last_report.ul_pkts,
+        .downlink_n_packets = urr_acc->dl_pkts - urr_acc->last_report.dl_pkts,
+    };
+    if (now >= last_report_timestamp)
+        report->usage_report[idx].dur_measurement = ((now - last_report_timestamp) + (OGS_USEC_PER_SEC/2)) / OGS_USEC_PER_SEC; /* FIXME: should use MONOTONIC here */
+    /* else memset sets it to 0 */
+    report->usage_report[idx].time_of_first_packet = ogs_time_to_ntp32(urr_acc->time_of_first_packet); /* TODO: First since last report? */
+    report->usage_report[idx].time_of_last_packet = ogs_time_to_ntp32(urr_acc->time_of_last_packet);
+
+    /* Time triggers: */
+    if (urr->quota_validity_time > 0 &&
+            report->usage_report[idx].dur_measurement >= urr->quota_validity_time)
+        report->usage_report[idx].rep_trigger.quota_validity_time = 1;
+    if (urr->time_quota > 0 &&
+            report->usage_report[idx].dur_measurement >= urr->time_quota)
+        report->usage_report[idx].rep_trigger.time_quota = 1;
+    if (urr->time_threshold > 0 &&
+            report->usage_report[idx].dur_measurement >= urr->time_threshold)
+        report->usage_report[idx].rep_trigger.time_threshold = 1;
+
+    /* Volume triggers: */
+    if (urr->rep_triggers.volume_quota && urr->vol_quota.tovol &&
+            report->usage_report[idx].vol_measurement.total_volume >= urr->vol_quota.total_volume)
+        report->usage_report[idx].rep_trigger.volume_quota = 1;
+    if (urr->rep_triggers.volume_threshold && urr->vol_threshold.tovol &&
+            report->usage_report[idx].vol_measurement.total_volume >= urr->vol_threshold.total_volume)
+        report->usage_report[idx].rep_trigger.volume_threshold = 1;
+}
+
+void upf_sess_urr_acc_snapshot(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    urr_acc->last_report.total_octets = urr_acc->total_octets;
+    urr_acc->last_report.dl_octets = urr_acc->dl_octets;
+    urr_acc->last_report.ul_octets = urr_acc->ul_octets;
+    urr_acc->last_report.total_pkts = urr_acc->total_pkts;
+    urr_acc->last_report.dl_pkts = urr_acc->dl_pkts;
+    urr_acc->last_report.ul_pkts = urr_acc->ul_pkts;
+    urr_acc->last_report.timestamp = ogs_time_now();
+}
+
+static void upf_sess_urr_acc_timers_cb(void *data)
+{
+    ogs_pfcp_urr_t *urr = (ogs_pfcp_urr_t *)data;
+    ogs_pfcp_user_plane_report_t report;
+    ogs_pfcp_sess_t *pfcp_sess = urr->sess;
+    upf_sess_t *sess = UPF_SESS(pfcp_sess);
+
+    ogs_info("upf_time_threshold_cb() triggered! urr=%p", urr);
+
+    if (urr->rep_triggers.quota_validity_time ||
+        urr->rep_triggers.time_quota ||
+        urr->rep_triggers.time_threshold) {
+        memset(&report, 0, sizeof(report));
+        upf_sess_urr_acc_fill_usage_report(sess, urr, &report, 0);
+        report.num_of_usage_report = 1;
+        upf_sess_urr_acc_snapshot(sess, urr);
+
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_report_request(sess, &report));
+    }
+    /* Start new report period/iteration: */
+    upf_sess_urr_acc_timers_setup(sess, urr);
+}
+
+static void upf_sess_urr_acc_validity_time_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    ogs_debug("Installing URR Quota Validity Time timer");
+    urr_acc->reporting_enabled = true;
+    if (!urr_acc->t_validity_time)
+        urr_acc->t_validity_time = ogs_timer_add(ogs_app()->timer_mgr,
+                                        upf_sess_urr_acc_timers_cb, urr);
+    ogs_timer_start(urr_acc->t_validity_time,
+            ogs_time_from_sec(urr->quota_validity_time));
+}
+
+static void upf_sess_urr_acc_time_quota_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    ogs_debug("Installing URR Time Quota timer");
+    urr_acc->reporting_enabled = true;
+    if (!urr_acc->t_time_quota)
+        urr_acc->t_time_quota = ogs_timer_add(ogs_app()->timer_mgr,
+                                        upf_sess_urr_acc_timers_cb, urr);
+    ogs_timer_start(urr_acc->t_time_quota, ogs_time_from_sec(urr->time_quota));
+}
+
+static void upf_sess_urr_acc_time_threshold_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    ogs_debug("Installing URR Time Threshold timer");
+    urr_acc->reporting_enabled = true;
+    if (!urr_acc->t_time_threshold)
+        urr_acc->t_time_threshold = ogs_timer_add(ogs_app()->timer_mgr,
+                                        upf_sess_urr_acc_timers_cb, urr);
+    ogs_timer_start(urr_acc->t_time_threshold,
+            ogs_time_from_sec(urr->time_threshold));
+}
+
+void upf_sess_urr_acc_timers_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr)
+{
+    upf_sess_urr_acc_t *urr_acc = NULL;
+
+    ogs_assert(urr->id > 0 && urr->id <= OGS_MAX_NUM_OF_URR);
+    urr_acc = &sess->urr_acc[urr->id-1];
+
+    urr_acc->time_start = ogs_time_ntp32_now();
+    if (urr->rep_triggers.quota_validity_time && urr->quota_validity_time > 0)
+        upf_sess_urr_acc_validity_time_setup(sess, urr);
+    if (urr->rep_triggers.time_quota && urr->time_quota > 0)
+        upf_sess_urr_acc_time_quota_setup(sess, urr);
+    if (urr->rep_triggers.time_threshold && urr->time_threshold > 0)
+        upf_sess_urr_acc_time_threshold_setup(sess, urr);
+}
+
+static void upf_sess_urr_acc_remove_all(upf_sess_t *sess)
+{
+    unsigned int i;
+    for (i = 0; i < OGS_ARRAY_SIZE(sess->urr_acc); i++) {
+        if (sess->urr_acc[i].t_time_threshold) {
+            ogs_timer_delete(sess->urr_acc[i].t_time_threshold);
+            sess->urr_acc[i].t_time_threshold = NULL;
+        }
+        if (sess->urr_acc[i].t_validity_time) {
+            ogs_timer_delete(sess->urr_acc[i].t_validity_time);
+            sess->urr_acc[i].t_validity_time = NULL;
+        }
+        if (sess->urr_acc[i].t_time_quota) {
+            ogs_timer_delete(sess->urr_acc[i].t_time_quota);
+            sess->urr_acc[i].t_time_quota = NULL;
+        }
+    }
+}
+===== context.h =====
+
+#ifndef UPF_CONTEXT_H
+#define UPF_CONTEXT_H
+
+#include "upf-config.h"
+
+#if HAVE_NET_IF_H
+#include <net/if.h>
+#endif
+
+#include "ogs-gtp.h"
+#include "ogs-pfcp.h"
+#include "ogs-app.h"
+
+#include "ipfw/ogs-ipfw.h"
+
+#include "timer.h"
+#include "upf-sm.h"
+#include "metrics.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern int __upf_log_domain;
+
+#undef OGS_LOG_DOMAIN
+#define OGS_LOG_DOMAIN __upf_log_domain
+
+struct upf_route_trie_node;
+
+typedef struct upf_context_s {
+    ogs_hash_t *upf_n4_seid_hash;   /* hash table (UPF-N4-SEID) */
+    ogs_hash_t *smf_n4_seid_hash;   /* hash table (SMF-N4-SEID) */
+    ogs_hash_t *smf_n4_f_seid_hash; /* hash table (SMF-N4-F-SEID) */
+    ogs_hash_t *ipv4_hash;  /* hash table (IPv4 Address) */
+    ogs_hash_t *ipv6_hash;  /* hash table (IPv6 Address) */
+
+    /* IPv4 framed routes trie */
+    struct upf_route_trie_node *ipv4_framed_routes;
+    /* IPv6 framed routes trie */
+    struct upf_route_trie_node *ipv6_framed_routes;
+
+    ogs_list_t sess_list;
+} upf_context_t;
+
+/* trie mapping from IP framed routes to session. */
+struct upf_route_trie_node {
+    struct upf_route_trie_node *left;
+    struct upf_route_trie_node *right;
+    upf_sess_t *sess;
+};
+
+/* Accounting: */
+typedef struct upf_sess_urr_acc_s {
+    bool reporting_enabled;
+    ogs_timer_t *t_validity_time; /* Quota Validity Time expiration handler */
+    ogs_timer_t *t_time_quota; /* Time Quota expiration handler */
+    ogs_timer_t *t_time_threshold; /* Time Threshold expiration handler */
+    uint32_t time_start; /* When t_time_* started */
+    ogs_pfcp_urr_ur_seqn_t report_seqn; /* Next seqn to use when reporting */
+    uint64_t total_octets;
+    uint64_t ul_octets;
+    uint64_t dl_octets;
+    uint64_t total_pkts;
+    uint64_t ul_pkts;
+    uint64_t dl_pkts;
+    ogs_time_t time_of_first_packet;
+    ogs_time_t time_of_last_packet;
+    /* Snapshot of measurement when last report was sent: */
+    struct {
+        uint64_t total_octets;
+        uint64_t ul_octets;
+        uint64_t dl_octets;
+        uint64_t total_pkts;
+        uint64_t ul_pkts;
+        uint64_t dl_pkts;
+        ogs_time_t timestamp;
+    } last_report;
+} upf_sess_urr_acc_t;
+
+#define UPF_SESS(pfcp_sess) ogs_container_of(pfcp_sess, upf_sess_t, pfcp)
+typedef struct upf_sess_s {
+    ogs_lnode_t     lnode;
+    ogs_pool_id_t   id;
+    ogs_pool_id_t   *upf_n4_seid_node;  /* A node of UPF-N4-SEID */
+
+    ogs_pfcp_sess_t pfcp;
+
+    uint64_t        upf_n4_seid;        /* UPF SEID is dervied from NODE */
+    struct {
+        uint64_t    seid;
+        ogs_ip_t    ip;
+    } smf_n4_f_seid;                    /* SMF SEID is received from Peer */
+
+    /* APN Configuration */
+    ogs_pfcp_ue_ip_t *ipv4;
+    ogs_pfcp_ue_ip_t *ipv6;
+
+    ogs_ipsubnet_t   *ipv4_framed_routes;
+    ogs_ipsubnet_t   *ipv6_framed_routes;
+
+    char            *gx_sid;            /* Gx Session ID */
+    ogs_pfcp_node_t *pfcp_node;
+
+    /* Accounting: */
+    upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR]; /* FIXME: This probably needs to be mved to a hashtable or alike */
+    char            *apn_dnn;            /* APN/DNN Item */
+} upf_sess_t;
+
+void upf_context_init(void);
+void upf_context_final(void);
+upf_context_t *upf_self(void);
+
+int upf_context_parse_config(void);
+
+upf_sess_t *upf_sess_add_by_message(ogs_pfcp_message_t *message);
+
+upf_sess_t *upf_sess_add(ogs_pfcp_f_seid_t *f_seid);
+int upf_sess_remove(upf_sess_t *sess);
+void upf_sess_remove_all(void);
+upf_sess_t *upf_sess_find_by_smf_n4_seid(uint64_t seid);
+upf_sess_t *upf_sess_find_by_smf_n4_f_seid(ogs_pfcp_f_seid_t *f_seid);
+upf_sess_t *upf_sess_find_by_upf_n4_seid(uint64_t seid);
+upf_sess_t *upf_sess_find_by_ipv4(uint32_t addr);
+upf_sess_t *upf_sess_find_by_ipv6(uint32_t *addr6);
+upf_sess_t *upf_sess_find_by_id(ogs_pool_id_t id);
+
+uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
+        uint8_t session_type, ogs_pfcp_pdr_t *pdr);
+uint8_t upf_sess_set_ue_ipv4_framed_routes(upf_sess_t *sess,
+        char *framed_routes[]);
+uint8_t upf_sess_set_ue_ipv6_framed_routes(upf_sess_t *sess,
+        char *framed_routes[]);
+
+void upf_sess_urr_acc_add(upf_sess_t *sess, ogs_pfcp_urr_t *urr, size_t size, bool is_uplink);
+void upf_sess_urr_acc_fill_usage_report(upf_sess_t *sess, const ogs_pfcp_urr_t *urr,
+                                        ogs_pfcp_user_plane_report_t *report, unsigned int idx);
+void upf_sess_urr_acc_snapshot(upf_sess_t *sess, ogs_pfcp_urr_t *urr);
+void upf_sess_urr_acc_timers_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_CONTEXT_H */
+===== event.c =====
+
+#include "event.h"
+#include "context.h"
+
+#if defined(HAVE_KQUEUE)
+/*
+ * kqueue does not support TUN/TAP character device
+ * So, PGW should use select action in I/O multiplexing
+ */
+extern const ogs_pollset_actions_t ogs_select_actions;
+
+extern ogs_pollset_actions_t ogs_pollset_actions;
+extern bool ogs_pollset_actions_initialized;
+
+static void pollset_action_setup(void)
+{
+    ogs_pollset_actions = ogs_select_actions;
+    ogs_pollset_actions_initialized = true;
+}
+#endif
+
+static OGS_POOL(pool, upf_event_t);
+
+void upf_event_init(void)
+{
+    ogs_pool_init(&pool, ogs_app()->pool.event);
+
+#if defined(HAVE_KQUEUE)
+    ogs_assert(ogs_app()->pollset);
+    ogs_pollset_destroy(ogs_app()->pollset);
+
+    pollset_action_setup();
+
+    ogs_app()->pollset = ogs_pollset_create(ogs_app()->pool.socket);
+    ogs_assert(ogs_app()->pollset);
+#endif
+}
+
+void upf_event_term(void)
+{
+    ogs_queue_term(ogs_app()->queue);
+    ogs_pollset_notify(ogs_app()->pollset);
+}
+
+void upf_event_final(void)
+{
+    ogs_pool_final(&pool);
+}
+
+upf_event_t *upf_event_new(upf_event_e id)
+{
+    upf_event_t *e = NULL;
+
+    ogs_pool_alloc(&pool, &e);
+    ogs_assert(e);
+    memset(e, 0, sizeof(*e));
+
+    e->id = id;
+
+    return e;
+}
+
+void upf_event_free(upf_event_t *e)
+{
+    ogs_assert(e);
+    ogs_pool_free(&pool, e);
+}
+
+const char *upf_event_get_name(upf_event_t *e)
+{
+    if (e == NULL)
+        return OGS_FSM_NAME_INIT_SIG;
+
+    switch (e->id) {
+    case OGS_FSM_ENTRY_SIG: 
+        return OGS_FSM_NAME_ENTRY_SIG;
+    case OGS_FSM_EXIT_SIG: 
+        return OGS_FSM_NAME_EXIT_SIG;
+
+    case UPF_EVT_N4_MESSAGE:
+        return "UPF_EVT_N4_MESSAGE";
+    case UPF_EVT_N4_TIMER:
+        return "UPF_EVT_N4_TIMER";
+    case UPF_EVT_N4_NO_HEARTBEAT:
+        return "UPF_EVT_N4_NO_HEARTBEAT";
+
+    default: 
+       break;
+    }
+
+    return "UNKNOWN_EVENT";
+}
+===== event.h =====
+
+#ifndef UPF_EVENT_H
+#define UPF_EVENT_H
+
+#include "ogs-proto.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct ogs_pfcp_node_s ogs_pfcp_node_t;
+typedef struct ogs_pfcp_xact_s ogs_pfcp_xact_t;
+typedef struct ogs_pfcp_message_s ogs_pfcp_message_t;
+typedef struct upf_sess_s upf_sess_t;
+
+typedef enum {
+    UPF_EVT_BASE = OGS_MAX_NUM_OF_PROTO_EVENT,
+
+    UPF_EVT_N4_MESSAGE,
+    UPF_EVT_N4_TIMER,
+    UPF_EVT_N4_NO_HEARTBEAT,
+
+    UPF_EVT_TOP,
+
+} upf_event_e;
+
+typedef struct upf_event_s {
+    int id;
+    int timer_id;
+
+    ogs_pkbuf_t *pkbuf;
+
+    ogs_pfcp_node_t *pfcp_node;
+    ogs_pool_id_t pfcp_xact_id;
+    ogs_pfcp_message_t *pfcp_message;
+} upf_event_t;
+
+OGS_STATIC_ASSERT(OGS_EVENT_SIZE >= sizeof(upf_event_t));
+
+void upf_event_init(void);
+void upf_event_term(void);
+void upf_event_final(void);
+
+upf_event_t *upf_event_new(upf_event_e id);
+void upf_event_free(upf_event_t *e);
+
+const char *upf_event_get_name(upf_event_t *e);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_EVENT_H */
+===== gtp-path.c =====
+
+#include "context.h"
+
+#if HAVE_NETINET_IP_H
+#include <netinet/ip.h>
+#endif
+
+#if HAVE_NETINET_IP6_H
+#include <netinet/ip6.h>
+#endif
+
+#if HAVE_NETINET_IP_ICMP_H
+#include <netinet/ip_icmp.h>
+#endif
+
+#if HAVE_NETINET_ICMP6_H
+#include <netinet/icmp6.h>
+#endif
+
+#if HAVE_SYS_IOCTL_H
+#include <sys/ioctl.h>
+#endif
+
+#if HAVE_NET_IF_DL_H
+#include <net/if_dl.h>
+#endif
+
+#if HAVE_IFADDRS_H
+#include <ifaddrs.h>
+#endif
+
+#include "arp-nd.h"
+#include "event.h"
+#include "gtp-path.h"
+#include "pfcp-path.h"
+#include "rule-match.h"
+
+#define UPF_GTP_HANDLED     1
+
+const uint8_t proxy_mac_addr[] = { 0x0e, 0x00, 0x00, 0x00, 0x00, 0x01 };
+
+static ogs_pkbuf_pool_t *packet_pool = NULL;
+
+static void upf_gtp_handle_multicast(ogs_pkbuf_t *recvbuf);
+
+static int check_framed_routes(upf_sess_t *sess, int family, uint32_t *addr)
+{
+    int i = 0;
+    ogs_ipsubnet_t *routes = family == AF_INET ?
+        sess->ipv4_framed_routes : sess->ipv6_framed_routes;
+
+    if (!routes)
+        return false;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        uint32_t *sub = routes[i].sub;
+        uint32_t *mask = routes[i].mask;
+
+        if (!routes[i].family)
+            break;
+
+        if (family == AF_INET) {
+            if (sub[0] == (addr[0] & mask[0]))
+                return true;
+        } else {
+            if (sub[0] == (addr[0] & mask[0]) &&
+                sub[1] == (addr[1] & mask[1]) &&
+                sub[2] == (addr[2] & mask[2]) &&
+                sub[3] == (addr[3] & mask[3]))
+                return true;
+        }
+    }
+    return false;
+}
+
+static uint16_t _get_eth_type(uint8_t *data, uint len) {
+    if (len > ETHER_HDR_LEN) {
+        struct ether_header *hdr = (struct ether_header*)data;
+        return htobe16(hdr->ether_type);
+    }
+    return 0;
+}
+
+static void _gtpv1_tun_recv_common_cb(
+        short when, ogs_socket_t fd, bool has_eth, void *data)
+{
+    ogs_pkbuf_t *recvbuf = NULL;
+
+    upf_sess_t *sess = NULL;
+    ogs_pfcp_pdr_t *pdr = NULL;
+    ogs_pfcp_pdr_t *fallback_pdr = NULL;
+    ogs_pfcp_far_t *far = NULL;
+    ogs_pfcp_user_plane_report_t report;
+    int i;
+
+    recvbuf = ogs_tun_read(fd, packet_pool);
+    if (!recvbuf) {
+        ogs_warn("ogs_tun_read() failed");
+        return;
+    }
+
+    if (has_eth) {
+        ogs_pkbuf_t *replybuf = NULL;
+        uint16_t eth_type = _get_eth_type(recvbuf->data, recvbuf->len);
+        uint8_t size;
+
+        if (eth_type == ETHERTYPE_ARP) {
+            if (is_arp_req(recvbuf->data, recvbuf->len) &&
+                    upf_sess_find_by_ipv4(
+                        arp_parse_target_addr(recvbuf->data, recvbuf->len))) {
+                replybuf = ogs_pkbuf_alloc(packet_pool, OGS_MAX_PKT_LEN);
+                ogs_assert(replybuf);
+                ogs_pkbuf_reserve(replybuf, OGS_TUN_MAX_HEADROOM);
+                ogs_pkbuf_put(replybuf, OGS_MAX_PKT_LEN-OGS_TUN_MAX_HEADROOM);
+                size = arp_reply(replybuf->data, recvbuf->data, recvbuf->len,
+                    proxy_mac_addr);
+                ogs_pkbuf_trim(replybuf, size);
+                ogs_info("[SEND] reply to ARP request: %u", size);
+            } else {
+                goto cleanup;
+            }
+        } else if (eth_type == ETHERTYPE_IPV6 &&
+                    is_nd_req(recvbuf->data, recvbuf->len)) {
+            replybuf = ogs_pkbuf_alloc(packet_pool, OGS_MAX_PKT_LEN);
+            ogs_assert(replybuf);
+            ogs_pkbuf_reserve(replybuf, OGS_TUN_MAX_HEADROOM);
+            ogs_pkbuf_put(replybuf, OGS_MAX_PKT_LEN-OGS_TUN_MAX_HEADROOM);
+            size = nd_reply(replybuf->data, recvbuf->data, recvbuf->len,
+                proxy_mac_addr);
+            ogs_pkbuf_trim(replybuf, size);
+            ogs_info("[SEND] reply to ND solicit: %u", size);
+        }
+        if (replybuf) {
+            if (ogs_tun_write(fd, replybuf) != OGS_OK)
+                ogs_warn("ogs_tun_write() for reply failed");
+            
+            ogs_pkbuf_free(replybuf);
+            goto cleanup;
+        }
+        if (eth_type != ETHERTYPE_IP && eth_type != ETHERTYPE_IPV6) {
+            ogs_error("[DROP] Invalid eth_type [%x]]", eth_type);
+            ogs_log_hexdump(OGS_LOG_ERROR, recvbuf->data, recvbuf->len);
+            goto cleanup;
+        }
+        ogs_pkbuf_pull(recvbuf, ETHER_HDR_LEN);
+    }
+
+    sess = upf_sess_find_by_ue_ip_address(recvbuf);
+    if (!sess)
+        goto cleanup;
+
+    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        far = pdr->far;
+        ogs_assert(far);
+
+        /* Check if PDR is Downlink */
+        if (pdr->src_if != OGS_PFCP_INTERFACE_CORE)
+            continue;
+
+        /* Save the Fallback PDR : Lowest precedence downlink PDR */
+        fallback_pdr = pdr;
+
+        /* Check if FAR is Downlink */
+        if (far->dst_if != OGS_PFCP_INTERFACE_ACCESS)
+            continue;
+
+        /* Check if Outer header creation */
+        if (far->outer_header_creation.ip4 == 0 &&
+            far->outer_header_creation.ip6 == 0 &&
+            far->outer_header_creation.udp4 == 0 &&
+            far->outer_header_creation.udp6 == 0 &&
+            far->outer_header_creation.gtpu4 == 0 &&
+            far->outer_header_creation.gtpu6 == 0)
+            continue;
+
+        /* Check if Rule List in PDR */
+        if (ogs_list_first(&pdr->rule_list) &&
+            ogs_pfcp_pdr_rule_find_by_packet(pdr, recvbuf) == NULL)
+            continue;
+
+        break;
+    }
+
+    if (!pdr)
+        pdr = fallback_pdr;
+
+    if (!pdr) {
+        if (ogs_global_conf()->parameter.multicast) {
+            upf_gtp_handle_multicast(recvbuf);
+        }
+        goto cleanup;
+    }
+
+    /* Increment total & dl octets + pkts */
+    for (i = 0; i < pdr->num_of_urr; i++)
+        upf_sess_urr_acc_add(sess, pdr->urr[i], recvbuf->len, false);
+
+    ogs_assert(true == ogs_pfcp_up_handle_pdr(
+                pdr, OGS_GTPU_MSGTYPE_GPDU, NULL, recvbuf, &report));
+
+    /*
+     * Issue #2210, Discussion #2208, #2209
+     *
+     * Metrics reduce data plane performance.
+     * It should not be used on the UPF/SGW-U data plane
+     * until this issue is resolved.
+     */
+#if 0
+    upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_GTP_OUTDATAPKTN3UPF);
+    upf_metrics_inst_by_qfi_add(pdr->qer->qfi,
+        UPF_METR_CTR_GTP_OUTDATAVOLUMEQOSLEVELN3UPF, recvbuf->len);
+#endif
+
+    if (report.type.downlink_data_report) {
+        ogs_assert(pdr->sess);
+        sess = UPF_SESS(pdr->sess);
+        ogs_assert(sess);
+
+        report.downlink_data.pdr_id = pdr->id;
+        if (pdr->qer && pdr->qer->qfi)
+            report.downlink_data.qfi = pdr->qer->qfi; /* for 5GC */
+
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_report_request(sess, &report));
+    }
+
+    /*
+     * The ogs_pfcp_up_handle_pdr() function
+     * buffers or frees the Packet Buffer(pkbuf) memory.
+     */
+    return;
+
+cleanup:
+    ogs_pkbuf_free(recvbuf);
+}
+
+static void _gtpv1_tun_recv_cb(short when, ogs_socket_t fd, void *data)
+{
+    _gtpv1_tun_recv_common_cb(when, fd, false, data);
+}
+
+static void _gtpv1_tun_recv_eth_cb(short when, ogs_socket_t fd, void *data)
+{
+    _gtpv1_tun_recv_common_cb(when, fd, true, data);
+}
+
+static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
+{
+    int len;
+    ssize_t size;
+    char buf1[OGS_ADDRSTRLEN];
+    char buf2[OGS_ADDRSTRLEN];
+
+    upf_sess_t *sess = NULL;
+
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_sock_t *sock = NULL;
+    ogs_sockaddr_t from;
+
+    ogs_gtp2_header_t *gtp_h = NULL;
+    ogs_gtp2_header_desc_t header_desc;
+    ogs_pfcp_user_plane_report_t report;
+
+    ogs_assert(fd != INVALID_SOCKET);
+    sock = data;
+    ogs_assert(sock);
+
+    pkbuf = ogs_pkbuf_alloc(packet_pool, OGS_MAX_PKT_LEN);
+    ogs_assert(pkbuf);
+    ogs_pkbuf_reserve(pkbuf, OGS_TUN_MAX_HEADROOM);
+    ogs_pkbuf_put(pkbuf, OGS_MAX_PKT_LEN-OGS_TUN_MAX_HEADROOM);
+
+    size = ogs_recvfrom(fd, pkbuf->data, pkbuf->len, 0, &from);
+    if (size <= 0) {
+        ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno,
+                "ogs_recv() failed");
+        goto cleanup;
+    }
+
+    ogs_pkbuf_trim(pkbuf, size);
+
+    ogs_assert(pkbuf);
+    ogs_assert(pkbuf->len);
+
+    gtp_h = (ogs_gtp2_header_t *)pkbuf->data;
+    if (gtp_h->version != OGS_GTP2_VERSION_1) {
+        ogs_error("[DROP] Invalid GTPU version [%d]", gtp_h->version);
+        ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+        goto cleanup;
+    }
+
+    len = ogs_gtpu_parse_header(&header_desc, pkbuf);
+    if (len < 0) {
+        ogs_error("[DROP] Cannot decode GTPU packet");
+        ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+        goto cleanup;
+    }
+    if (header_desc.type == OGS_GTPU_MSGTYPE_ECHO_REQ) {
+        ogs_pkbuf_t *echo_rsp;
+
+        ogs_debug("[RECV] Echo Request from [%s]", OGS_ADDR(&from, buf1));
+        echo_rsp = ogs_gtp2_handle_echo_req(pkbuf);
+        ogs_expect(echo_rsp);
+        if (echo_rsp) {
+            ssize_t sent;
+
+            /* Echo reply */
+            ogs_debug("[SEND] Echo Response to [%s]", OGS_ADDR(&from, buf1));
+
+            sent = ogs_sendto(fd, echo_rsp->data, echo_rsp->len, 0, &from);
+            if (sent < 0 || sent != echo_rsp->len) {
+                ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno,
+                        "ogs_sendto() failed");
+            }
+            ogs_pkbuf_free(echo_rsp);
+        }
+        goto cleanup;
+    }
+    if (header_desc.type != OGS_GTPU_MSGTYPE_END_MARKER &&
+        pkbuf->len <= len) {
+        ogs_error("[DROP] Small GTPU packet(type:%d len:%d)",
+                header_desc.type, len);
+        ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+        goto cleanup;
+    }
+
+    ogs_trace("[RECV] GPU-U Type [%d] from [%s] : TEID[0x%x]",
+            header_desc.type, OGS_ADDR(&from, buf1), header_desc.teid);
+
+    /* Remove GTP header and send packets to TUN interface */
+    ogs_assert(ogs_pkbuf_pull(pkbuf, len));
+
+    if (header_desc.type == OGS_GTPU_MSGTYPE_END_MARKER) {
+        /* Nothing */
+
+    } else if (header_desc.type == OGS_GTPU_MSGTYPE_ERR_IND) {
+        ogs_pfcp_far_t *far = NULL;
+
+        far = ogs_pfcp_far_find_by_gtpu_error_indication(pkbuf);
+        if (far) {
+            ogs_assert(true ==
+                ogs_pfcp_up_handle_error_indication(far, &report));
+
+            if (report.type.error_indication_report) {
+                ogs_assert(far->sess);
+                sess = UPF_SESS(far->sess);
+                ogs_assert(sess);
+
+                ogs_assert(OGS_OK ==
+                    upf_pfcp_send_session_report_request(sess, &report));
+            }
+
+        } else {
+            ogs_error("[DROP] Cannot find FAR by Error-Indication");
+            ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+        }
+    } else if (header_desc.type == OGS_GTPU_MSGTYPE_GPDU) {
+        uint16_t eth_type = 0;
+        struct ip *ip_h = NULL;
+        uint32_t *src_addr = NULL;
+        ogs_pfcp_object_t *pfcp_object = NULL;
+        ogs_pfcp_sess_t *pfcp_sess = NULL;
+        ogs_pfcp_pdr_t *pdr = NULL;
+        ogs_pfcp_far_t *far = NULL;
+
+        ogs_pfcp_subnet_t *subnet = NULL;
+        ogs_pfcp_dev_t *dev = NULL;
+        int i;
+
+        ip_h = (struct ip *)pkbuf->data;
+        ogs_assert(ip_h);
+
+        /*
+         * Issue #2210, Discussion #2208, #2209
+         *
+         * Metrics reduce data plane performance.
+         * It should not be used on the UPF/SGW-U data plane
+         * until this issue is resolved.
+         */
+#if 0
+        upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_GTP_INDATAPKTN3UPF);
+        upf_metrics_inst_by_qfi_add(header_desc.qos_flow_identifier,
+                UPF_METR_CTR_GTP_INDATAVOLUMEQOSLEVELN3UPF, pkbuf->len);
+#endif
+
+        pfcp_object = ogs_pfcp_object_find_by_teid(header_desc.teid);
+        if (!pfcp_object) {
+            /*
+             * TS23.527 Restoration procedures
+             * 4.3 UPF Restoration Procedures
+             * 4.3.2 Restoration Procedure for PSA UPF Restart
+             *
+             * The UPF shall not send GTP-U Error indication message
+             * for a configurable period after an UPF restart
+             * when the UPF receives a G-PDU not matching any PDRs.
+             */
+            if (ogs_time_ntp32_now() >
+                   (ogs_pfcp_self()->local_recovery +
+                    ogs_time_sec(ogs_local_conf()->time.message.pfcp.
+                        association_interval))) {
+                ogs_error("[%s] Send Error Indication [TEID:0x%x] to [%s]",
+                        OGS_ADDR(&sock->local_addr, buf1),
+                        header_desc.teid,
+                        OGS_ADDR(&from, buf2));
+                ogs_gtp1_send_error_indication(
+                        sock, header_desc.teid,
+                        header_desc.qos_flow_identifier, &from);
+            }
+            goto cleanup;
+        }
+
+        switch(pfcp_object->type) {
+        case OGS_PFCP_OBJ_PDR_TYPE:
+            /* UPF does not use PDR TYPE */
+            ogs_assert_if_reached();
+            pdr = (ogs_pfcp_pdr_t *)pfcp_object;
+            ogs_assert(pdr);
+            break;
+        case OGS_PFCP_OBJ_SESS_TYPE:
+            pfcp_sess = (ogs_pfcp_sess_t *)pfcp_object;
+            ogs_assert(pfcp_sess);
+
+            ogs_list_for_each(&pfcp_sess->pdr_list, pdr) {
+
+                /* Check if Source Interface */
+                if (pdr->src_if != OGS_PFCP_INTERFACE_ACCESS &&
+                    pdr->src_if != OGS_PFCP_INTERFACE_CP_FUNCTION)
+                    continue;
+
+                /* Check if TEID */
+                if (header_desc.teid != pdr->f_teid.teid)
+                    continue;
+
+                /* Check if QFI */
+                if (pdr->qfi && pdr->qfi != header_desc.qos_flow_identifier)
+                    continue;
+
+                /* Check if Rule List in PDR */
+                if (ogs_list_first(&pdr->rule_list) &&
+                    ogs_pfcp_pdr_rule_find_by_packet(pdr, pkbuf) == NULL)
+                    continue;
+
+                break;
+            }
+
+            if (!pdr) {
+                /*
+                 * TS23.527 Restoration procedures
+                 * 4.3 UPF Restoration Procedures
+                 * 4.3.2 Restoration Procedure for PSA UPF Restart
+                 *
+                 * The UPF shall not send GTP-U Error indication message
+                 * for a configurable period after an UPF restart
+                 * when the UPF receives a G-PDU not matching any PDRs.
+                 */
+                if (ogs_time_ntp32_now() >
+                       (ogs_pfcp_self()->local_recovery +
+                        ogs_time_sec(ogs_local_conf()->time.message.pfcp.
+                            association_interval))) {
+                    ogs_error(
+                            "[%s] Send Error Indication [TEID:0x%x] to [%s]",
+                            OGS_ADDR(&sock->local_addr, buf1),
+                            header_desc.teid,
+                            OGS_ADDR(&from, buf2));
+                    ogs_gtp1_send_error_indication(
+                            sock, header_desc.teid,
+                            header_desc.qos_flow_identifier, &from);
+                }
+                goto cleanup;
+            }
+
+            break;
+        default:
+            ogs_fatal("Unknown type [%d]", pfcp_object->type);
+            ogs_assert_if_reached();
+        }
+
+        ogs_assert(pdr);
+        ogs_assert(pdr->sess);
+        ogs_assert(pdr->sess->obj.type == OGS_PFCP_OBJ_SESS_TYPE);
+
+        sess = UPF_SESS(pdr->sess);
+        ogs_assert(sess);
+
+        far = pdr->far;
+        ogs_assert(far);
+
+        if (ip_h->ip_v == 4 && sess->ipv4) {
+            src_addr = (void *)&ip_h->ip_src.s_addr;
+            ogs_assert(src_addr);
+
+            /*
+             * From Issue #1354
+             *
+             * Do not check Indirect Tunnel
+             *    pdr->dst_if = OGS_PFCP_INTERFACE_ACCESS;
+             *    far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
+             */
+            if (far->dst_if != OGS_PFCP_INTERFACE_ACCESS) {
+
+                if (src_addr[0] == sess->ipv4->addr[0]) {
+                    /* Source IP address should be matched in uplink */
+                } else if (check_framed_routes(sess, AF_INET, src_addr)) {
+                    /* Or source IP address should match a framed route */
+                } else {
+                    ogs_error("[DROP] Source IP-%d Spoofing APN:%s SrcIf:%d DstIf:%d TEID:0x%x",
+                                ip_h->ip_v, pdr->dnn, pdr->src_if, far->dst_if, header_desc.teid);
+                    ogs_error("       SRC:%08X, UE:%08X",
+                        be32toh(src_addr[0]), be32toh(sess->ipv4->addr[0]));
+                    ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+
+                    goto cleanup;
+                }
+            }
+
+            subnet = sess->ipv4->subnet;
+            eth_type = ETHERTYPE_IP;
+
+        } else if (ip_h->ip_v == 6 && sess->ipv6) {
+            struct ip6_hdr *ip6_h = (struct ip6_hdr *)pkbuf->data;
+            ogs_assert(ip6_h);
+            src_addr = (void *)ip6_h->ip6_src.s6_addr;
+            ogs_assert(src_addr);
+
+            /*
+             * From Issue #1354
+             *
+             * Do not check Router Advertisement
+             *    pdr->src_if = OGS_PFCP_INTERFACE_CP_FUNCTION;
+             *    far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
+             *
+             * Do not check Indirect Tunnel
+             *    pdr->dst_if = OGS_PFCP_INTERFACE_ACCESS;
+             *    far->dst_if = OGS_PFCP_INTERFACE_ACCESS;
+             */
+            if (far->dst_if != OGS_PFCP_INTERFACE_ACCESS) {
+
+/*
+ * Discussion #1776 was raised,
+ * but we decided not to allow unspecified addresses
+ * because Open5GS has already sent interface identifiers
+ * in the registgration/attach process.
+ *
+ *
+ * RFC4861
+ * 4.  Message Formats
+ * 4.1.  Router Solicitation Message Format
+ * IP Fields:
+ *    Source Address
+ *                  An IP address assigned to the sending interface, or
+ *                  the unspecified address if no address is assigned
+ *                  to the sending interface.
+ *
+ * 6.1.  Message Validation
+ * 6.1.1.  Validation of Router Solicitation Messages
+ *  Hosts MUST silently discard any received Router Solicitation
+ *  Messages.
+ *
+ *  A router MUST silently discard any received Router Solicitation
+ *  messages that do not satisfy all of the following validity checks:
+ *
+ *  ..
+ *  ..
+ *
+ *  - If the IP source address is the unspecified address, there is no
+ *    source link-layer address option in the message.
+ */
+                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr) &&
+                    src_addr[2] == sess->ipv6->addr[2] &&
+                    src_addr[3] == sess->ipv6->addr[3]) {
+                    /*
+                     * if Link-local address,
+                     * Interface Identifier should be matched
+                     */
+                } else if (src_addr[0] == sess->ipv6->addr[0] &&
+                            src_addr[1] == sess->ipv6->addr[1]) {
+                    /*
+                     * If Global address
+                     * 64 bit prefix should be matched
+                     */
+                } else if (check_framed_routes(sess, AF_INET6, src_addr)) {
+                    /* Or source IP address should match a framed route */
+                } else {
+                    ogs_error("[DROP] Source IP-%d Spoofing APN:%s SrcIf:%d DstIf:%d TEID:0x%x",
+                                ip_h->ip_v, pdr->dnn, pdr->src_if, far->dst_if, header_desc.teid);
+                    ogs_error("SRC:%08x %08x %08x %08x",
+                            be32toh(src_addr[0]), be32toh(src_addr[1]),
+                            be32toh(src_addr[2]), be32toh(src_addr[3]));
+                    ogs_error("UE:%08x %08x %08x %08x",
+                            be32toh(sess->ipv6->addr[0]),
+                            be32toh(sess->ipv6->addr[1]),
+                            be32toh(sess->ipv6->addr[2]),
+                            be32toh(sess->ipv6->addr[3]));
+                    ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+
+                    goto cleanup;
+                }
+            }
+
+            subnet = sess->ipv6->subnet;
+            eth_type = ETHERTYPE_IPV6;
+
+        } else {
+            ogs_error("Invalid packet [IP version:%d, Packet Length:%d]",
+                    ip_h->ip_v, pkbuf->len);
+            ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+            goto cleanup;
+        }
+
+        if (far->dst_if == OGS_PFCP_INTERFACE_CORE) {
+
+            if (!subnet) {
+#if 0 /* It's redundant log message */
+                ogs_error("[DROP] Cannot find subnet V:%d, IPv4:%p, IPv6:%p",
+                        ip_h->ip_v, sess->ipv4, sess->ipv6);
+                ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+#endif
+                goto cleanup;
+            }
+
+            dev = subnet->dev;
+            ogs_assert(dev);
+
+            /* Increment total & ul octets + pkts */
+            for (i = 0; i < pdr->num_of_urr; i++)
+                upf_sess_urr_acc_add(sess, pdr->urr[i], pkbuf->len, true);
+
+            if (dev->is_tap) {
+                ogs_assert(eth_type);
+                eth_type = htobe16(eth_type);
+                ogs_pkbuf_push(pkbuf, sizeof(eth_type));
+                memcpy(pkbuf->data, &eth_type, sizeof(eth_type));
+                ogs_pkbuf_push(pkbuf, ETHER_ADDR_LEN);
+                memcpy(pkbuf->data, proxy_mac_addr, ETHER_ADDR_LEN);
+                ogs_pkbuf_push(pkbuf, ETHER_ADDR_LEN);
+                memcpy(pkbuf->data, dev->mac_addr, ETHER_ADDR_LEN);
+            }
+
+            /* TODO: if destined to another UE, hairpin back out. */
+            if (ogs_tun_write(dev->fd, pkbuf) != OGS_OK)
+                ogs_warn("ogs_tun_write() failed");
+
+        } else if (far->dst_if == OGS_PFCP_INTERFACE_ACCESS) {
+            ogs_assert(true == ogs_pfcp_up_handle_pdr(
+                        pdr, header_desc.type, &header_desc, pkbuf, &report));
+
+            if (report.type.downlink_data_report) {
+                ogs_error("Indirect Data Fowarding Buffered");
+
+                report.downlink_data.pdr_id = pdr->id;
+                if (pdr->qer && pdr->qer->qfi)
+                    report.downlink_data.qfi = pdr->qer->qfi; /* for 5GC */
+
+                ogs_assert(OGS_OK ==
+                    upf_pfcp_send_session_report_request(sess, &report));
+            }
+
+            /*
+             * The ogs_pfcp_up_handle_pdr() function
+             * buffers or frees the Packet Buffer(pkbuf) memory.
+             */
+            return;
+
+        } else if (far->dst_if == OGS_PFCP_INTERFACE_CP_FUNCTION) {
+
+            if (!far->gnode) {
+                ogs_error("No Outer Header Creation in FAR");
+                goto cleanup;
+            }
+
+            if ((far->apply_action & OGS_PFCP_APPLY_ACTION_FORW) == 0) {
+                ogs_error("Not supported Apply Action [0x%x]",
+                            far->apply_action);
+                goto cleanup;
+            }
+
+            ogs_assert(true == ogs_pfcp_up_handle_pdr(
+                        pdr, header_desc.type, &header_desc, pkbuf, &report));
+
+            ogs_assert(report.type.downlink_data_report == 0);
+
+            /*
+             * The ogs_pfcp_up_handle_pdr() function
+             * buffers or frees the Packet Buffer(pkbuf) memory.
+             */
+            return;
+
+        } else {
+            ogs_fatal("Not implemented : FAR-DST_IF[%d]", far->dst_if);
+            ogs_assert_if_reached();
+        }
+    } else {
+        ogs_error("[DROP] Invalid GTPU Type [%d]", header_desc.type);
+        ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+    }
+
+cleanup:
+    ogs_pkbuf_free(pkbuf);
+}
+
+int upf_gtp_init(void)
+{
+    ogs_pkbuf_config_t config;
+    memset(&config, 0, sizeof config);
+
+    config.cluster_2048_pool = ogs_app()->pool.packet;
+
+#if OGS_USE_TALLOC == 1
+    /* allocate a talloc pool for GTP to ensure it doesn't have to go back
+     * to the libc malloc all the time */
+    packet_pool = talloc_pool(__ogs_talloc_core, 1000*1024);
+    ogs_assert(packet_pool);
+#else
+    packet_pool = ogs_pkbuf_pool_create(&config);
+#endif
+
+    return OGS_OK;
+}
+
+void upf_gtp_final(void)
+{
+    ogs_pkbuf_pool_destroy(packet_pool);
+}
+
+static void _get_dev_mac_addr(char *ifname, uint8_t *mac_addr)
+{
+#ifdef SIOCGIFHWADDR
+    int fd = socket(PF_INET, SOCK_DGRAM, 0);
+    ogs_assert(fd);
+    struct ifreq req;
+    memset(&req, 0, sizeof(req));
+    ogs_cpystrn(req.ifr_name, ifname, IF_NAMESIZE-1);
+    ogs_assert(ioctl(fd, SIOCGIFHWADDR, &req) == 0);
+    memcpy(mac_addr, req.ifr_hwaddr.sa_data, ETHER_ADDR_LEN);
+#else
+    struct ifaddrs *ifap;
+    ogs_assert(getifaddrs(&ifap) == 0);
+    struct ifaddrs *p;
+    for (p = ifap; p; p = p->ifa_next) {
+        if (strncmp(ifname, p->ifa_name, IF_NAMESIZE-1) == 0) {
+            struct sockaddr_dl* sdp = (struct sockaddr_dl*) p->ifa_addr;
+            memcpy(mac_addr, sdp->sdl_data + sdp->sdl_nlen, ETHER_ADDR_LEN);
+            freeifaddrs(ifap);
+            return;
+        }
+    }
+    ogs_assert(0); /* interface not found. */
+#endif
+}
+
+int upf_gtp_open(void)
+{
+    ogs_pfcp_dev_t *dev = NULL;
+    ogs_pfcp_subnet_t *subnet = NULL;
+    ogs_socknode_t *node = NULL;
+    ogs_sock_t *sock = NULL;
+    int rc;
+
+    ogs_list_for_each(&ogs_gtp_self()->gtpu_list, node) {
+        sock = ogs_gtp_server(node);
+        if (!sock) return OGS_ERROR;
+
+        if (sock->family == AF_INET)
+            ogs_gtp_self()->gtpu_sock = sock;
+        else if (sock->family == AF_INET6)
+            ogs_gtp_self()->gtpu_sock6 = sock;
+
+        node->poll = ogs_pollset_add(ogs_app()->pollset,
+                OGS_POLLIN, sock->fd, _gtpv1_u_recv_cb, sock);
+        ogs_assert(node->poll);
+    }
+
+    OGS_SETUP_GTPU_SERVER;
+
+    /* NOTE : tun device can be created via following command.
+     *
+     * $ sudo ip tuntap add name ogstun mode tun
+     *
+     * Also, before running upf, assign the one IP from IP pool of UE
+     * to ogstun. The IP should not be assigned to UE
+     *
+     * $ sudo ifconfig ogstun 45.45.0.1/16 up
+     *
+     */
+
+    /* Open Tun interface */
+    ogs_list_for_each(&ogs_pfcp_self()->dev_list, dev) {
+        dev->is_tap = strstr(dev->ifname, "tap");
+        dev->fd = ogs_tun_open(dev->ifname, OGS_MAX_IFNAME_LEN, dev->is_tap);
+        if (dev->fd == INVALID_SOCKET) {
+            ogs_error("tun_open(dev:%s) failed", dev->ifname);
+            return OGS_ERROR;
+        }
+
+        if (dev->is_tap) {
+            _get_dev_mac_addr(dev->ifname, dev->mac_addr);
+            dev->poll = ogs_pollset_add(ogs_app()->pollset,
+                    OGS_POLLIN, dev->fd, _gtpv1_tun_recv_eth_cb, NULL);
+            ogs_assert(dev->poll);
+        } else {
+            dev->poll = ogs_pollset_add(ogs_app()->pollset,
+                    OGS_POLLIN, dev->fd, _gtpv1_tun_recv_cb, NULL);
+            ogs_assert(dev->poll);
+        }
+
+        ogs_assert(dev->poll);
+    }
+
+    /*
+     * On Linux, it is possible to create a persistent tun/tap
+     * interface which will continue to exist even if open5gs quit,
+     * although this is normally not required.
+     * It can be useful to set up a tun/tap interface owned
+     * by a non-root user, so open5gs can be started without
+     * needing any root privileges at all.
+     */
+
+    /* Set P-to-P IP address with Netmask
+     * Note that Linux will skip this configuration */
+    ogs_list_for_each(&ogs_pfcp_self()->subnet_list, subnet) {
+        ogs_assert(subnet->dev);
+        rc = ogs_tun_set_ip(subnet->dev->ifname, &subnet->gw, &subnet->sub);
+        if (rc != OGS_OK) {
+            ogs_error("ogs_tun_set_ip(dev:%s) failed", subnet->dev->ifname);
+            return OGS_ERROR;
+        }
+    }
+
+    return OGS_OK;
+}
+
+void upf_gtp_close(void)
+{
+    ogs_pfcp_dev_t *dev = NULL;
+
+    ogs_socknode_remove_all(&ogs_gtp_self()->gtpu_list);
+
+    ogs_list_for_each(&ogs_pfcp_self()->dev_list, dev) {
+        if (dev->poll)
+            ogs_pollset_remove(dev->poll);
+        ogs_closesocket(dev->fd);
+    }
+}
+
+static void upf_gtp_handle_multicast(ogs_pkbuf_t *recvbuf)
+{
+    struct ip *ip_h =  NULL;
+    struct ip6_hdr *ip6_h = NULL;
+    ogs_pfcp_user_plane_report_t report;
+
+    ip_h = (struct ip *)recvbuf->data;
+    if (ip_h->ip_v == 6) {
+#if COMPILE_ERROR_IN_MAC_OS_X  /* Compiler error in Mac OS X platform */
+        ip6_h = (struct ip6_hdr *)recvbuf->data;
+        if (IN6_IS_ADDR_MULTICAST(&ip6_h->ip6_dst))
+#else
+        struct in6_addr ip6_dst;
+        ip6_h = (struct ip6_hdr *)recvbuf->data;
+        memcpy(&ip6_dst, &ip6_h->ip6_dst, sizeof(struct in6_addr));
+        if (IN6_IS_ADDR_MULTICAST(&ip6_dst))
+#endif
+        {
+            upf_sess_t *sess = NULL;
+
+            /* IPv6 Multicast */
+            ogs_list_for_each(&upf_self()->sess_list, sess) {
+                if (sess->ipv6) {
+                    /* PDN IPv6 is available */
+                    ogs_pfcp_pdr_t *pdr = NULL;
+
+                    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+                        if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) {
+                            ogs_pkbuf_t *sendbuf = ogs_pkbuf_copy(recvbuf);
+                            ogs_assert(sendbuf);
+                            ogs_assert(true ==
+                                ogs_pfcp_up_handle_pdr(
+                                    pdr, OGS_GTPU_MSGTYPE_GPDU,
+                                    NULL, sendbuf, &report));
+                            break;
+                        }
+                    }
+
+                    return;
+                }
+            }
+        }
+    }
+}
+===== gtp-path.h =====
+
+#ifndef UPF_GTP_PATH_H
+#define UPF_GTP_PATH_H
+
+#include "ogs-tun.h"
+#include "ogs-gtp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int upf_gtp_init(void);
+void upf_gtp_final(void);
+
+int upf_gtp_open(void);
+void upf_gtp_close(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_GTP_PATH_H */
+===== init.c =====
+
+#include "context.h"
+#include "gtp-path.h"
+#include "pfcp-path.h"
+#include "metrics.h"
+
+static ogs_thread_t *thread;
+static void upf_main(void *data);
+
+static int initialized = 0;
+
+int upf_initialize(void)
+{
+    int rv;
+
+#define APP_NAME "upf"
+    rv = ogs_app_parse_local_conf(APP_NAME);
+    if (rv != OGS_OK) return rv;
+
+    upf_metrics_init();
+
+    ogs_gtp_context_init(OGS_MAX_NUM_OF_GTPU_RESOURCE);
+    ogs_pfcp_context_init();
+
+    upf_context_init();
+    upf_event_init();
+    upf_gtp_init();
+
+    rv = ogs_pfcp_xact_init();
+    if (rv != OGS_OK) return rv;
+
+    rv = ogs_log_config_domain(
+            ogs_app()->logger.domain, ogs_app()->logger.level);
+    if (rv != OGS_OK) return rv;
+
+    rv = ogs_gtp_context_parse_config(APP_NAME, "smf");
+    if (rv != OGS_OK) return rv;
+
+    rv = ogs_pfcp_context_parse_config(APP_NAME, "smf");
+    if (rv != OGS_OK) return rv;
+
+    rv = ogs_metrics_context_parse_config(APP_NAME);
+    if (rv != OGS_OK) return rv;
+
+    rv = upf_context_parse_config();
+    if (rv != OGS_OK) return rv;
+
+    rv = ogs_pfcp_ue_pool_generate();
+    if (rv != OGS_OK) return rv;
+
+    ogs_metrics_context_open(ogs_metrics_self());
+
+    rv = upf_pfcp_open();
+    if (rv != OGS_OK) return rv;
+
+    rv = upf_gtp_open();
+    if (rv != OGS_OK) return rv;
+
+    thread = ogs_thread_create(upf_main, NULL);
+    if (!thread) return OGS_ERROR;
+
+    initialized = 1;
+
+    return OGS_OK;
+}
+
+void upf_terminate(void)
+{
+    if (!initialized) return;
+
+    upf_event_term();
+
+    ogs_thread_destroy(thread);
+
+    upf_pfcp_close();
+    upf_gtp_close();
+
+    ogs_metrics_context_close(ogs_metrics_self());
+
+    upf_context_final();
+
+    ogs_pfcp_context_final();
+    ogs_gtp_context_final();
+
+    ogs_pfcp_xact_final();
+
+    upf_gtp_final();
+    upf_event_final();
+
+    upf_metrics_final();
+}
+
+static void upf_main(void *data)
+{
+    ogs_fsm_t upf_sm;
+    int rv;
+
+    ogs_fsm_init(&upf_sm, upf_state_initial, upf_state_final, 0);
+
+    for ( ;; ) {
+        ogs_pollset_poll(ogs_app()->pollset,
+                ogs_timer_mgr_next(ogs_app()->timer_mgr));
+
+        /*
+         * After ogs_pollset_poll(), ogs_timer_mgr_expire() must be called.
+         *
+         * The reason is why ogs_timer_mgr_next() can get the corrent value
+         * when ogs_timer_stop() is called internally in ogs_timer_mgr_expire().
+         *
+         * You should not use event-queue before ogs_timer_mgr_expire().
+         * In this case, ogs_timer_mgr_expire() does not work
+         * because 'if rv == OGS_DONE' statement is exiting and
+         * not calling ogs_timer_mgr_expire().
+         */
+        ogs_timer_mgr_expire(ogs_app()->timer_mgr);
+
+        for ( ;; ) {
+            upf_event_t *e = NULL;
+
+            rv = ogs_queue_trypop(ogs_app()->queue, (void**)&e);
+            ogs_assert(rv != OGS_ERROR);
+
+            if (rv == OGS_DONE)
+                goto done;
+
+            if (rv == OGS_RETRY)
+                break;
+
+            ogs_assert(e);
+            ogs_fsm_dispatch(&upf_sm, e);
+            upf_event_free(e);
+        }
+    }
+done:
+
+    ogs_fsm_fini(&upf_sm, 0);
+}
+===== meson.build =====
+# Copyright (C) 2019 by Sukchan Lee <acetcom@gmail.com>
+
+# This file is part of Open5GS.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+upf_conf = configuration_data()
+
+upf_headers = ('''
+    ifaddrs.h
+    net/ethernet.h
+    net/if.h
+    net/if_dl.h
+    netinet/in.h
+    netinet/ip.h
+    netinet/ip6.h
+    netinet/ip_icmp.h
+    netinet/icmp6.h
+    sys/ioctl.h
+    sys/socket.h
+'''.split())
+
+foreach h : upf_headers
+    if cc.has_header(h)
+        define = 'HAVE_' + h.underscorify().to_upper()
+        upf_conf.set(define, 1)
+    endif
+endforeach
+
+if have_func_kqueue
+    upf_conf.set('HAVE_KQUEUE', 1)
+endif
+
+configure_file(output : 'upf-config.h', configuration : upf_conf)
+
+libupf_sources = files('''
+    rule-match.h
+    event.h
+    timer.h
+    metrics.h
+    context.h
+    upf-sm.h
+    gtp-path.h
+    pfcp-path.h
+    n4-build.h
+    n4-handler.h
+
+    rule-match.c
+    init.c
+    metrics.c
+    event.c
+    timer.c
+    context.c
+    upf-sm.c
+    pfcp-sm.c
+    gtp-path.c
+    pfcp-path.c
+    n4-build.c
+    n4-handler.c
+'''.split())
+
+libtins_dep = dependency('libtins',
+    version: ['>=3.4'],
+    fallback: ['libtins', 'libtins_dep'])
+
+libarp_nd = static_library('arp_nd',
+    sources : files('''
+      arp-nd.cpp
+      arp-nd.h
+    '''.split()),
+    dependencies : libtins_dep,
+    install : false)
+libarp_nd_dep = declare_dependency(
+    link_with : libarp_nd,
+    dependencies : libtins_dep)
+
+libupf = static_library('upf',
+    sources : libupf_sources,
+    dependencies : [
+        libmetrics_dep,
+        libpfcp_dep,
+        libtun_dep,
+        libarp_nd_dep,
+    ],
+    install : false)
+
+libupf_dep = declare_dependency(
+    link_with : libupf,
+    dependencies : [
+        libmetrics_dep,
+        libpfcp_dep,
+        libtun_dep,
+        libarp_nd_dep,
+    ])
+
+upf_sources = files('''
+    app.c
+    ../main.c
+'''.split())
+
+executable('open5gs-upfd',
+    sources : upf_sources,
+    c_args : '-DDEFAULT_CONFIG_FILENAME="@0@/upf.yaml"'.format(open5gs_sysconfdir),
+    include_directories : srcinc,
+    dependencies : libupf_dep,
+    install_rpath : libdir,
+    install : true)
+===== metrics.c =====
+#include "ogs-app.h"
+#include "context.h"
+
+#include "metrics.h"
+
+typedef struct upf_metrics_spec_def_s {
+    unsigned int type;
+    const char *name;
+    const char *description;
+    int initial_val;
+    unsigned int num_labels;
+    const char **labels;
+} upf_metrics_spec_def_t;
+
+/* Helper generic functions: */
+static int upf_metrics_init_inst(ogs_metrics_inst_t **inst,
+        ogs_metrics_spec_t **specs, unsigned int len,
+        unsigned int num_labels, const char **labels)
+{
+    unsigned int i;
+    for (i = 0; i < len; i++)
+        inst[i] = ogs_metrics_inst_new(specs[i], num_labels, labels);
+    return OGS_OK;
+}
+
+static int upf_metrics_free_inst(ogs_metrics_inst_t **inst,
+        unsigned int len)
+{
+    unsigned int i;
+    for (i = 0; i < len; i++)
+        ogs_metrics_inst_free(inst[i]);
+    memset(inst, 0, sizeof(inst[0]) * len);
+    return OGS_OK;
+}
+
+static int upf_metrics_init_spec(ogs_metrics_context_t *ctx,
+        ogs_metrics_spec_t **dst, upf_metrics_spec_def_t *src, unsigned int len)
+{
+    unsigned int i;
+    for (i = 0; i < len; i++) {
+        dst[i] = ogs_metrics_spec_new(ctx, src[i].type,
+                src[i].name, src[i].description,
+                src[i].initial_val, src[i].num_labels, src[i].labels,
+                NULL);
+    }
+    return OGS_OK;
+}
+
+/* GLOBAL */
+ogs_metrics_spec_t *upf_metrics_spec_global[_UPF_METR_GLOB_MAX];
+ogs_metrics_inst_t *upf_metrics_inst_global[_UPF_METR_GLOB_MAX];
+upf_metrics_spec_def_t upf_metrics_spec_def_global[_UPF_METR_GLOB_MAX] = {
+/* Global Counters: */
+[UPF_METR_GLOB_CTR_GTP_INDATAPKTN3UPF] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "fivegs_ep_n3_gtp_indatapktn3upf",
+    .description = "Number of incoming GTP data packets on the N3 interface",
+},
+[UPF_METR_GLOB_CTR_GTP_OUTDATAPKTN3UPF] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "fivegs_ep_n3_gtp_outdatapktn3upf",
+    .description = "Number of outgoing GTP data packets on the N3 interface",
+},
+[UPF_METR_GLOB_CTR_SM_N4SESSIONESTABREQ] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "fivegs_upffunction_sm_n4sessionestabreq",
+    .description = "Number of requested N4 session establishments",
+},
+[UPF_METR_GLOB_CTR_SM_N4SESSIONREPORT] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "fivegs_upffunction_sm_n4sessionreport",
+    .description = "Number of requested N4 session reports",
+},
+[UPF_METR_GLOB_CTR_SM_N4SESSIONREPORTSUCC] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "fivegs_upffunction_sm_n4sessionreportsucc",
+    .description = "Number of successful N4 session reports",
+},
+/* Global Gauges: */
+[UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR] = {
+    .type = OGS_METRICS_METRIC_TYPE_GAUGE,
+    .name = "fivegs_upffunction_upf_sessionnbr",
+    .description = "Active Sessions",
+},
+[UPF_METR_GLOB_GAUGE_PFCP_PEERS_ACTIVE] = {
+    .type = OGS_METRICS_METRIC_TYPE_GAUGE,
+    .name = "pfcp_peers_active",
+    .description = "Active PFCP peers",
+},
+};
+int upf_metrics_init_inst_global(void)
+{
+    return upf_metrics_init_inst(upf_metrics_inst_global, upf_metrics_spec_global,
+                _UPF_METR_GLOB_MAX, 0, NULL);
+}
+int upf_metrics_free_inst_global(void)
+{
+    return upf_metrics_free_inst(upf_metrics_inst_global, _UPF_METR_GLOB_MAX);
+}
+
+/* BY_QFI */
+const char *labels_qfi[] = {
+    "qfi"
+};
+#define UPF_METR_BY_QFI_CTR_ENTRY(_id, _name, _desc) \
+    [_id] = { \
+        .type = OGS_METRICS_METRIC_TYPE_COUNTER, \
+        .name = _name, \
+        .description = _desc, \
+        .num_labels = OGS_ARRAY_SIZE(labels_qfi), \
+        .labels = labels_qfi, \
+    },
+ogs_metrics_spec_t *upf_metrics_spec_by_qfi[_UPF_METR_BY_QFI_MAX];
+ogs_hash_t *metrics_hash_by_qfi = NULL;   /* hash table for QFI label */
+upf_metrics_spec_def_t upf_metrics_spec_def_by_qfi[_UPF_METR_BY_QFI_MAX] = {
+/* Counters: */
+UPF_METR_BY_QFI_CTR_ENTRY(
+    UPF_METR_CTR_GTP_INDATAVOLUMEQOSLEVELN3UPF,
+    "fivegs_ep_n3_gtp_indatavolumeqosleveln3upf",
+    "Data volume of incoming GTP data packets per QoS level on the N3 interface")
+UPF_METR_BY_QFI_CTR_ENTRY(
+    UPF_METR_CTR_GTP_OUTDATAVOLUMEQOSLEVELN3UPF,
+    "fivegs_ep_n3_gtp_outdatavolumeqosleveln3upf",
+    "Data volume of outgoing GTP data packets per QoS level on the N3 interface")
+};
+void upf_metrics_init_by_qfi(void);
+int upf_metrics_free_inst_by_qfi(ogs_metrics_inst_t **inst);
+typedef struct upf_metric_key_by_qfi_s {
+    uint8_t                     qfi;
+    upf_metric_type_by_qfi_t    t;
+} upf_metric_key_by_qfi_t;
+
+void upf_metrics_init_by_qfi(void)
+{
+    metrics_hash_by_qfi = ogs_hash_make();
+    ogs_assert(metrics_hash_by_qfi);
+}
+void upf_metrics_inst_by_qfi_add(uint8_t qfi,
+        upf_metric_type_by_qfi_t t, int val)
+{
+    ogs_metrics_inst_t *metrics = NULL;
+    upf_metric_key_by_qfi_t *qfi_key;
+
+    qfi_key = ogs_calloc(1, sizeof(*qfi_key));
+    ogs_assert(qfi_key);
+
+    qfi_key->qfi = qfi;
+    qfi_key->t = t;
+
+    metrics = ogs_hash_get(metrics_hash_by_qfi,
+            qfi_key, sizeof(*qfi_key));
+
+    if (!metrics) {
+        char qfi_str[4];
+        ogs_snprintf(qfi_str, sizeof(qfi_str), "%d", qfi);
+
+        metrics = ogs_metrics_inst_new(upf_metrics_spec_by_qfi[t],
+                upf_metrics_spec_def_by_qfi->num_labels,
+                (const char *[]){ qfi_str });
+
+        ogs_assert(metrics);
+        ogs_hash_set(metrics_hash_by_qfi,
+                qfi_key, sizeof(*qfi_key), metrics);
+    } else {
+        ogs_free(qfi_key);
+    }
+
+    ogs_metrics_inst_add(metrics, val);
+}
+
+int upf_metrics_free_inst_by_qfi(ogs_metrics_inst_t **inst)
+{
+    return upf_metrics_free_inst(inst, _UPF_METR_BY_QFI_MAX);
+}
+
+/* BY_CAUSE */
+const char *labels_cause[] = {
+    "cause"
+};
+
+#define UPF_METR_BY_CAUSE_CTR_ENTRY(_id, _name, _desc) \
+    [_id] = { \
+        .type = OGS_METRICS_METRIC_TYPE_COUNTER, \
+        .name = _name, \
+        .description = _desc, \
+        .num_labels = OGS_ARRAY_SIZE(labels_cause), \
+        .labels = labels_cause, \
+    },
+ogs_metrics_spec_t *upf_metrics_spec_by_cause[_UPF_METR_BY_CAUSE_MAX];
+ogs_hash_t *metrics_hash_by_cause = NULL;   /* hash table for CAUSE labels */
+upf_metrics_spec_def_t upf_metrics_spec_def_by_cause[_UPF_METR_BY_CAUSE_MAX] = {
+/* Counters: */
+UPF_METR_BY_CAUSE_CTR_ENTRY(
+    UPF_METR_CTR_SM_N4SESSIONESTABFAIL,
+    "fivegs_upffunction_sm_n4sessionestabfail",
+    "Number of failed N4 session establishments")
+};
+void upf_metrics_init_by_cause(void);
+int upf_metrics_free_inst_by_cause(ogs_metrics_inst_t **inst);
+typedef struct upf_metric_key_by_cause_s {
+    uint8_t                     cause;
+    upf_metric_type_by_cause_t  t;
+} upf_metric_key_by_cause_t;
+
+void upf_metrics_init_by_cause(void)
+{
+    metrics_hash_by_cause = ogs_hash_make();
+    ogs_assert(metrics_hash_by_cause);
+}
+
+void upf_metrics_inst_by_cause_add(uint8_t cause,
+        upf_metric_type_by_cause_t t, int val)
+{
+    ogs_metrics_inst_t *metrics = NULL;
+    upf_metric_key_by_cause_t *cause_key;
+
+    cause_key = ogs_calloc(1, sizeof(*cause_key));
+    ogs_assert(cause_key);
+
+    cause_key->cause = cause;
+    cause_key->t = t;
+
+    metrics = ogs_hash_get(metrics_hash_by_cause,
+            cause_key, sizeof(*cause_key));
+
+    if (!metrics) {
+        char cause_str[4];
+        ogs_snprintf(cause_str, sizeof(cause_str), "%d", cause);
+
+        metrics = ogs_metrics_inst_new(upf_metrics_spec_by_cause[t],
+                upf_metrics_spec_def_by_cause->num_labels,
+                (const char *[]){ cause_str });
+
+        ogs_assert(metrics);
+        ogs_hash_set(metrics_hash_by_cause,
+                cause_key, sizeof(*cause_key), metrics);
+    } else {
+        ogs_free(cause_key);
+    }
+
+    ogs_metrics_inst_add(metrics, val);
+}
+
+int upf_metrics_free_inst_by_cause(ogs_metrics_inst_t **inst)
+{
+    return upf_metrics_free_inst(inst, _UPF_METR_BY_CAUSE_MAX);
+}
+
+/* BY_DNN */
+const char *labels_dnn[] = {
+    "dnn"
+};
+
+#define UPF_METR_BY_DNN_GAUGE_ENTRY(_id, _name, _desc) \
+    [_id] = { \
+        .type = OGS_METRICS_METRIC_TYPE_GAUGE, \
+        .name = _name, \
+        .description = _desc, \
+        .num_labels = OGS_ARRAY_SIZE(labels_dnn), \
+        .labels = labels_dnn, \
+    },
+ogs_metrics_spec_t *upf_metrics_spec_by_dnn[_UPF_METR_BY_DNN_MAX];
+ogs_hash_t *metrics_hash_by_dnn = NULL;   /* hash table for DNN labels */
+upf_metrics_spec_def_t upf_metrics_spec_def_by_dnn[_UPF_METR_BY_DNN_MAX] = {
+/* Gauges: */
+UPF_METR_BY_DNN_GAUGE_ENTRY(
+    UPF_METR_GAUGE_UPF_QOSFLOWS,
+    "fivegs_upffunction_upf_qosflows",
+    "Number of QoS flows of UPF")
+};
+void upf_metrics_init_by_dnn(void);
+int upf_metrics_free_inst_by_dnn(ogs_metrics_inst_t **inst);
+typedef struct upf_metric_key_by_dnn_s {
+    char                        dnn[OGS_MAX_DNN_LEN+1];
+    upf_metric_type_by_dnn_t    t;
+} upf_metric_key_by_dnn_t;
+
+void upf_metrics_init_by_dnn(void)
+{
+    metrics_hash_by_dnn = ogs_hash_make();
+    ogs_assert(metrics_hash_by_dnn);
+}
+
+void upf_metrics_inst_by_dnn_add(char *dnn,
+        upf_metric_type_by_dnn_t t, int val)
+{
+    ogs_metrics_inst_t *metrics = NULL;
+    upf_metric_key_by_dnn_t *dnn_key;
+
+    dnn_key = ogs_calloc(1, sizeof(*dnn_key));
+    ogs_assert(dnn_key);
+
+    if (dnn) {
+        ogs_cpystrn(dnn_key->dnn, dnn, ogs_min(strlen(dnn), OGS_MAX_DNN_LEN)+1);
+    } else {
+        dnn_key->dnn[0] = '\0';
+    }
+
+    dnn_key->t = t;
+
+    metrics = ogs_hash_get(metrics_hash_by_dnn,
+            dnn_key, sizeof(*dnn_key));
+
+    if (!metrics) {
+        metrics = ogs_metrics_inst_new(upf_metrics_spec_by_dnn[t],
+                upf_metrics_spec_def_by_dnn->num_labels,
+                (const char *[]){ dnn_key->dnn });
+
+        ogs_assert(metrics);
+        ogs_hash_set(metrics_hash_by_dnn,
+                dnn_key, sizeof(*dnn_key), metrics);
+    } else {
+        ogs_free(dnn_key);
+    }
+
+    ogs_metrics_inst_add(metrics, val);
+}
+
+int upf_metrics_free_inst_by_dnn(ogs_metrics_inst_t **inst)
+{
+    return upf_metrics_free_inst(inst, _UPF_METR_BY_DNN_MAX);
+}
+
+void upf_metrics_init(void)
+{
+    ogs_metrics_context_t *ctx = ogs_metrics_self();
+    ogs_metrics_context_init();
+
+    upf_metrics_init_spec(ctx, upf_metrics_spec_global, upf_metrics_spec_def_global,
+            _UPF_METR_GLOB_MAX);
+    upf_metrics_init_spec(ctx, upf_metrics_spec_by_qfi,
+            upf_metrics_spec_def_by_qfi, _UPF_METR_BY_QFI_MAX);
+    upf_metrics_init_spec(ctx, upf_metrics_spec_by_cause,
+            upf_metrics_spec_def_by_cause, _UPF_METR_BY_CAUSE_MAX);
+    upf_metrics_init_spec(ctx, upf_metrics_spec_by_dnn,
+            upf_metrics_spec_def_by_dnn, _UPF_METR_BY_DNN_MAX);
+
+    upf_metrics_init_inst_global();
+    upf_metrics_init_by_qfi();
+    upf_metrics_init_by_cause();
+    upf_metrics_init_by_dnn();
+}
+
+void upf_metrics_final(void)
+{
+    ogs_hash_index_t *hi;
+
+    if (metrics_hash_by_qfi) {
+        for (hi = ogs_hash_first(metrics_hash_by_qfi); hi; hi = ogs_hash_next(hi)) {
+            upf_metric_key_by_qfi_t *key =
+                (upf_metric_key_by_qfi_t *)ogs_hash_this_key(hi);
+            //void *val = ogs_hash_this_val(hi);
+
+            ogs_hash_set(metrics_hash_by_qfi, key, sizeof(*key), NULL);
+
+            ogs_free(key);
+            /* don't free val (metric itself) -
+             * it will be free'd by ogs_metrics_context_final() */
+            //ogs_free(val);
+        }
+        ogs_hash_destroy(metrics_hash_by_qfi);
+    }
+    if (metrics_hash_by_cause) {
+        for (hi = ogs_hash_first(metrics_hash_by_cause); hi; hi = ogs_hash_next(hi)) {
+            upf_metric_key_by_cause_t *key =
+                (upf_metric_key_by_cause_t *)ogs_hash_this_key(hi);
+            //void *val = ogs_hash_this_val(hi);
+
+            ogs_hash_set(metrics_hash_by_cause, key, sizeof(*key), NULL);
+
+            ogs_free(key);
+            /* don't free val (metric itself) -
+             * it will be free'd by ogs_metrics_context_final() */
+            //ogs_free(val);
+        }
+        ogs_hash_destroy(metrics_hash_by_cause);
+    }
+    if (metrics_hash_by_dnn) {
+        for (hi = ogs_hash_first(metrics_hash_by_dnn); hi; hi = ogs_hash_next(hi)) {
+            upf_metric_key_by_dnn_t *key =
+                (upf_metric_key_by_dnn_t *)ogs_hash_this_key(hi);
+            //void *val = ogs_hash_this_val(hi);
+
+            ogs_hash_set(metrics_hash_by_dnn, key, sizeof(*key), NULL);
+
+            ogs_free(key);
+            /* don't free val (metric itself) -
+             * it will be free'd by ogs_metrics_context_final() */
+            //ogs_free(val);
+        }
+        ogs_hash_destroy(metrics_hash_by_dnn);
+    }
+
+    ogs_metrics_context_final();
+}
+===== metrics.h =====
+#ifndef UPF_METRICS_H
+#define UPF_METRICS_H
+
+#include "ogs-metrics.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* GLOBAL */
+typedef enum upf_metric_type_global_s {
+    UPF_METR_GLOB_CTR_GTP_INDATAPKTN3UPF = 0,
+    UPF_METR_GLOB_CTR_GTP_OUTDATAPKTN3UPF,
+    UPF_METR_GLOB_CTR_SM_N4SESSIONESTABREQ,
+    UPF_METR_GLOB_CTR_SM_N4SESSIONREPORT,
+    UPF_METR_GLOB_CTR_SM_N4SESSIONREPORTSUCC,
+    UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR,
+    UPF_METR_GLOB_GAUGE_PFCP_PEERS_ACTIVE,
+    _UPF_METR_GLOB_MAX,
+} upf_metric_type_global_t;
+extern ogs_metrics_inst_t *upf_metrics_inst_global[_UPF_METR_GLOB_MAX];
+
+int upf_metrics_init_inst_global(void);
+int upf_metrics_free_inst_global(void);
+
+static inline void upf_metrics_inst_global_set(upf_metric_type_global_t t, int val)
+{ ogs_metrics_inst_set(upf_metrics_inst_global[t], val); }
+static inline void upf_metrics_inst_global_add(upf_metric_type_global_t t, int val)
+{ ogs_metrics_inst_add(upf_metrics_inst_global[t], val); }
+static inline void upf_metrics_inst_global_inc(upf_metric_type_global_t t)
+{ ogs_metrics_inst_inc(upf_metrics_inst_global[t]); }
+static inline void upf_metrics_inst_global_dec(upf_metric_type_global_t t)
+{ ogs_metrics_inst_dec(upf_metrics_inst_global[t]); }
+
+/* BY QFI */
+typedef enum upf_metric_type_by_qfi_s {
+    UPF_METR_CTR_GTP_INDATAVOLUMEQOSLEVELN3UPF = 0,
+    UPF_METR_CTR_GTP_OUTDATAVOLUMEQOSLEVELN3UPF,
+    _UPF_METR_BY_QFI_MAX,
+} upf_metric_type_by_qfi_t;
+
+void upf_metrics_inst_by_qfi_add(
+    uint8_t qfi, upf_metric_type_by_qfi_t t, int val);
+
+/* BY CAUSE */
+typedef enum upf_metric_type_by_cause_s {
+    UPF_METR_CTR_SM_N4SESSIONESTABFAIL = 0,
+    _UPF_METR_BY_CAUSE_MAX,
+} upf_metric_type_by_cause_t;
+
+void upf_metrics_inst_by_cause_add(
+    uint8_t cause, upf_metric_type_by_cause_t t, int val);
+
+/* BY DNN */
+typedef enum upf_metric_type_by_dnn_s {
+    UPF_METR_GAUGE_UPF_QOSFLOWS = 0,
+    _UPF_METR_BY_DNN_MAX,
+} upf_metric_type_by_dnn_t;
+
+void upf_metrics_inst_by_dnn_add(
+    char *dnn, upf_metric_type_by_dnn_t t, int val);
+
+void upf_metrics_init(void);
+void upf_metrics_final(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_METRICS_H */
+===== n4-build.c =====
+
+#include "context.h"
+#include "n4-build.h"
+
+ogs_pkbuf_t *upf_n4_build_session_establishment_response(uint8_t type,
+    upf_sess_t *sess, ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr)
+{
+    ogs_pfcp_message_t *pfcp_message = NULL;
+    ogs_pfcp_session_establishment_response_t *rsp = NULL;
+    ogs_pkbuf_t *pkbuf = NULL;
+
+    int i = 0, j = 0;
+
+    ogs_pfcp_node_id_t node_id;
+    ogs_pfcp_f_seid_t f_seid;
+    int len = 0;
+
+    ogs_debug("Session Establishment Response");
+
+    pfcp_message = ogs_calloc(1, sizeof(*pfcp_message));
+    if (!pfcp_message) {
+        ogs_error("ogs_calloc() failed");
+        return NULL;
+    }
+
+    rsp = &pfcp_message->pfcp_session_establishment_response;
+
+    /* Node ID */
+    ogs_pfcp_sockaddr_to_node_id(&node_id, &len);
+    rsp->node_id.presence = 1;
+    rsp->node_id.data = &node_id;
+    rsp->node_id.len = len;
+
+    /* Cause */
+    rsp->cause.presence = 1;
+    rsp->cause.u8 = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    /* F-SEID */
+    ogs_pfcp_sockaddr_to_f_seid(&f_seid, &len);
+    f_seid.seid = htobe64(sess->upf_n4_seid);
+    rsp->up_f_seid.presence = 1;
+    rsp->up_f_seid.data = &f_seid;
+    rsp->up_f_seid.len = len;
+
+    ogs_pfcp_pdrbuf_init();
+
+    /* Created PDR */
+    for (i = 0, j = 0; i < num_of_created_pdr; i++) {
+        bool pdr_presence = ogs_pfcp_build_created_pdr(
+                &rsp->created_pdr[j], i, created_pdr[i]);
+        if (pdr_presence == true) j++;
+    }
+
+    pfcp_message->h.type = type;
+    pkbuf = ogs_pfcp_build_msg(pfcp_message);
+    ogs_expect(pkbuf);
+
+    ogs_pfcp_pdrbuf_clear();
+    ogs_free(pfcp_message);
+
+    return pkbuf;
+}
+
+ogs_pkbuf_t *upf_n4_build_session_modification_response(uint8_t type,
+    upf_sess_t *sess, ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr)
+{
+    ogs_pfcp_message_t *pfcp_message = NULL;
+    ogs_pfcp_session_modification_response_t *rsp = NULL;
+    ogs_pkbuf_t *pkbuf = NULL;
+
+    int i = 0, j = 0;
+
+    ogs_debug("Session Modification Response");
+
+    pfcp_message = ogs_calloc(1, sizeof(*pfcp_message));
+    if (!pfcp_message) {
+        ogs_error("ogs_calloc() failed");
+        return NULL;
+    }
+
+    rsp = &pfcp_message->pfcp_session_modification_response;
+
+    /* Cause */
+    rsp->cause.presence = 1;
+    rsp->cause.u8 = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    ogs_pfcp_pdrbuf_init();
+
+    /* Created PDR */
+    for (i = 0, j = 0; i < num_of_created_pdr; i++) {
+        bool pdr_presence = ogs_pfcp_build_created_pdr(
+                &rsp->created_pdr[j], i, created_pdr[i]);
+        if (pdr_presence == true) j++;
+    }
+
+    pfcp_message->h.type = type;
+    pkbuf = ogs_pfcp_build_msg(pfcp_message);
+    ogs_expect(pkbuf);
+
+    ogs_pfcp_pdrbuf_clear();
+    ogs_free(pfcp_message);
+
+    return pkbuf;
+}
+
+ogs_pkbuf_t *upf_n4_build_session_deletion_response(uint8_t type,
+        upf_sess_t *sess)
+{
+    ogs_pfcp_urr_t *urr = NULL;
+    ogs_pfcp_user_plane_report_t report;
+    size_t num_of_reports = 0;
+    ogs_debug("Session Deletion Response");
+
+    memset(&report, 0, sizeof(report));
+    ogs_list_for_each(&sess->pfcp.urr_list, urr) {
+        ogs_assert(num_of_reports < OGS_ARRAY_SIZE(report.usage_report));
+        upf_sess_urr_acc_fill_usage_report(sess, urr, &report, num_of_reports);
+        report.usage_report[num_of_reports].rep_trigger.termination_report = 1;
+        num_of_reports++;
+        upf_sess_urr_acc_snapshot(sess, urr);
+    }
+    report.num_of_usage_report = num_of_reports;
+
+    return ogs_pfcp_build_session_deletion_response(type, OGS_PFCP_CAUSE_REQUEST_ACCEPTED,
+                                                    &report);
+}
+===== n4-build.h =====
+
+#ifndef UPF_N4_BUILD_H
+#define UPF_N4_BUILD_H
+
+#include "ogs-gtp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+ogs_pkbuf_t *upf_n4_build_session_establishment_response(uint8_t type,
+    upf_sess_t *sess, ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr);
+ogs_pkbuf_t *upf_n4_build_session_modification_response(uint8_t type,
+    upf_sess_t *sess, ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr);
+ogs_pkbuf_t *upf_n4_build_session_deletion_response(uint8_t type,
+    upf_sess_t *sess);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_N4_BUILD_H */
+===== n4-handler.c =====
+
+#include "context.h"
+#include "pfcp-path.h"
+#include "gtp-path.h"
+#include "n4-handler.h"
+
+static void upf_n4_handle_create_urr(upf_sess_t *sess, ogs_pfcp_tlv_create_urr_t *create_urr_arr,
+                              uint8_t *cause_value, uint8_t *offending_ie_value)
+{
+    int i;
+    ogs_pfcp_urr_t *urr;
+
+    *cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_URR; i++) {
+        urr = ogs_pfcp_handle_create_urr(&sess->pfcp, &create_urr_arr[i],
+                    cause_value, offending_ie_value);
+        if (!urr)
+            return;
+
+        /* TODO: enable counters somewhere else if ISTM not set, upon first pkt received */
+        if (urr->meas_info.istm) {
+            upf_sess_urr_acc_timers_setup(sess, urr);
+        }
+    }
+}
+
+void upf_n4_handle_session_establishment_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_establishment_request_t *req)
+{
+    ogs_pfcp_pdr_t *pdr = NULL;
+    ogs_pfcp_far_t *far = NULL;
+    ogs_pfcp_pdr_t *created_pdr[OGS_MAX_NUM_OF_PDR];
+    int num_of_created_pdr = 0;
+    uint8_t cause_value = 0;
+    uint8_t offending_ie_value = 0;
+    int i;
+
+    ogs_pfcp_sereq_flags_t sereq_flags;
+    bool restoration_indication = false;
+
+    upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONESTABREQ);
+
+    ogs_assert(xact);
+    ogs_assert(req);
+
+    ogs_debug("Session Establishment Request");
+
+    cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    if (!sess) {
+        ogs_error("No Context");
+        ogs_pfcp_send_error_message(xact, 0,
+                OGS_PFCP_SESSION_ESTABLISHMENT_RESPONSE_TYPE,
+                OGS_PFCP_CAUSE_MANDATORY_IE_MISSING, 0);
+        upf_metrics_inst_by_cause_add(OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
+                UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
+        return;
+    }
+
+    memset(&sereq_flags, 0, sizeof(sereq_flags));
+    if (req->pfcpsereq_flags.presence == 1)
+        sereq_flags.value = req->pfcpsereq_flags.u8;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
+        created_pdr[i] = ogs_pfcp_handle_create_pdr(&sess->pfcp,
+                &req->create_pdr[i], &sereq_flags,
+                &cause_value, &offending_ie_value);
+        if (created_pdr[i] == NULL)
+            break;
+    }
+    num_of_created_pdr = i;
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        if (ogs_pfcp_handle_create_far(&sess->pfcp, &req->create_far[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    upf_n4_handle_create_urr(sess, &req->create_urr[0], &cause_value, &offending_ie_value);
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    if (req->apn_dnn.presence) {
+        char apn_dnn[OGS_MAX_DNN_LEN+1];
+
+        if (ogs_fqdn_parse(apn_dnn, req->apn_dnn.data,
+            ogs_min(req->apn_dnn.len, OGS_MAX_DNN_LEN)) <= 0) {
+            ogs_error("Invalid APN");
+            cause_value = OGS_PFCP_CAUSE_MANDATORY_IE_INCORRECT;
+            goto cleanup;
+        }
+
+        if (sess->apn_dnn)
+            ogs_free(sess->apn_dnn);
+        sess->apn_dnn = ogs_strdup(apn_dnn);
+        ogs_assert(sess->apn_dnn);
+    }
+
+    for (i = 0; i < OGS_MAX_NUM_OF_QER; i++) {
+        if (ogs_pfcp_handle_create_qer(&sess->pfcp, &req->create_qer[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+                UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    ogs_pfcp_handle_create_bar(&sess->pfcp, &req->create_bar,
+                &cause_value, &offending_ie_value);
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    /* Setup GTP Node */
+    ogs_list_for_each(&sess->pfcp.far_list, far) {
+        if (OGS_ERROR == ogs_pfcp_setup_far_gtpu_node(far)) {
+            ogs_fatal("CHECK CONFIGURATION: upf.gtpu");
+            ogs_fatal("ogs_pfcp_setup_far_gtpu_node() failed");
+            goto cleanup;
+        }
+        if (far->gnode)
+            ogs_pfcp_far_f_teid_hash_set(far);
+    }
+
+    /* PFCPSEReq-Flags */
+    if (sereq_flags.restoration_indication == 1) {
+        for (i = 0; i < num_of_created_pdr; i++) {
+            pdr = created_pdr[i];
+            ogs_assert(pdr);
+
+    /*
+     * Only perform TEID restoration via swap when F-TEID.ch is false.
+     *
+     * When F-TEID.ch is false, it means the TEID has already been assigned, and
+     * the restoration process can safely perform the swap.
+     *
+     * If F-TEID.ch is true, it indicates that the UPF needs to assign
+     * a new TEID for the first time, so performing a swap is not appropriate
+     * in this case.
+     */
+            if (pdr->f_teid.ch == false) {
+                cause_value = ogs_pfcp_pdr_swap_teid(pdr);
+                if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+                    goto cleanup;
+            }
+        }
+        restoration_indication = true;
+    }
+
+    for (i = 0; i < num_of_created_pdr; i++) {
+        pdr = created_pdr[i];
+        ogs_assert(pdr);
+
+        /* Setup UE IP address */
+        if (pdr->ue_ip_addr_len) {
+            if (req->pdn_type.presence == 1) {
+                cause_value = upf_sess_set_ue_ip(sess, req->pdn_type.u8, pdr);
+                if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+                    goto cleanup;
+            } else {
+                ogs_error("No PDN Type");
+            }
+        }
+
+        if (pdr->ipv4_framed_routes) {
+            cause_value =
+                upf_sess_set_ue_ipv4_framed_routes(sess,
+                        pdr->ipv4_framed_routes);
+            if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+                goto cleanup;
+        }
+
+        if (pdr->ipv6_framed_routes) {
+            cause_value =
+                upf_sess_set_ue_ipv6_framed_routes(sess,
+                        pdr->ipv6_framed_routes);
+            if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+                goto cleanup;
+        }
+
+        /* Setup UPF-N3-TEID & QFI Hash */
+        if (pdr->f_teid_len)
+            ogs_pfcp_object_teid_hash_set(
+                    OGS_PFCP_OBJ_SESS_TYPE, pdr, restoration_indication);
+    }
+
+    /* Send Buffered Packet to gNB/SGW */
+    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) { /* Downlink */
+            ogs_pfcp_send_buffered_packet(pdr);
+        }
+    }
+
+    if (restoration_indication == true ||
+        ogs_pfcp_self()->up_function_features.ftup == 0)
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_establishment_response(
+                xact, sess, NULL, 0));
+    else
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_establishment_response(
+                xact, sess, created_pdr, num_of_created_pdr));
+
+    return;
+
+cleanup:
+    upf_metrics_inst_by_cause_add(cause_value,
+            UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
+    ogs_pfcp_sess_clear(&sess->pfcp);
+    ogs_pfcp_send_error_message(xact, sess ? sess->smf_n4_f_seid.seid : 0,
+            OGS_PFCP_SESSION_ESTABLISHMENT_RESPONSE_TYPE,
+            cause_value, offending_ie_value);
+}
+
+void upf_n4_handle_session_modification_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_modification_request_t *req)
+{
+    ogs_pfcp_pdr_t *pdr = NULL;
+    ogs_pfcp_far_t *far = NULL;
+    ogs_pfcp_pdr_t *created_pdr[OGS_MAX_NUM_OF_PDR];
+    int num_of_created_pdr = 0;
+    uint8_t cause_value = 0;
+    uint8_t offending_ie_value = 0;
+    int i;
+
+    ogs_assert(xact);
+    ogs_assert(req);
+
+    ogs_debug("Session Modification Request");
+
+    cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    if (!sess) {
+        ogs_error("No Context");
+        ogs_pfcp_send_error_message(xact, 0,
+                OGS_PFCP_SESSION_MODIFICATION_RESPONSE_TYPE,
+                OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
+        return;
+    }
+
+    for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
+        created_pdr[i] = ogs_pfcp_handle_create_pdr(&sess->pfcp,
+                &req->create_pdr[i], NULL, &cause_value, &offending_ie_value);
+        if (created_pdr[i] == NULL)
+            break;
+    }
+    num_of_created_pdr = i;
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
+        if (ogs_pfcp_handle_update_pdr(&sess->pfcp, &req->update_pdr[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
+        if (ogs_pfcp_handle_remove_pdr(&sess->pfcp, &req->remove_pdr[i],
+                &cause_value, &offending_ie_value) == false)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        if (ogs_pfcp_handle_create_far(&sess->pfcp, &req->create_far[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        if (ogs_pfcp_handle_update_far_flags(&sess->pfcp, &req->update_far[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    /* Send End Marker to gNB */
+    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) { /* Downlink */
+            far = pdr->far;
+            if (far && far->smreq_flags.send_end_marker_packets)
+                ogs_assert(OGS_ERROR != ogs_pfcp_send_end_marker(pdr));
+        }
+    }
+    /* Clear PFCPSMReq-Flags */
+    ogs_list_for_each(&sess->pfcp.far_list, far)
+        far->smreq_flags.value = 0;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        if (ogs_pfcp_handle_update_far(&sess->pfcp, &req->update_far[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        if (ogs_pfcp_handle_remove_far(&sess->pfcp, &req->remove_far[i],
+                &cause_value, &offending_ie_value) == false)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    upf_n4_handle_create_urr(sess, &req->create_urr[0], &cause_value, &offending_ie_value);
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_URR; i++) {
+        if (ogs_pfcp_handle_update_urr(&sess->pfcp, &req->update_urr[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_URR; i++) {
+        if (ogs_pfcp_handle_remove_urr(&sess->pfcp, &req->remove_urr[i],
+                &cause_value, &offending_ie_value) == false)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_QER; i++) {
+        if (ogs_pfcp_handle_create_qer(&sess->pfcp, &req->create_qer[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+                UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_QER; i++) {
+        if (ogs_pfcp_handle_update_qer(&sess->pfcp, &req->update_qer[i],
+                    &cause_value, &offending_ie_value) == NULL)
+            break;
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    for (i = 0; i < OGS_MAX_NUM_OF_QER; i++) {
+        if (ogs_pfcp_handle_remove_qer(&sess->pfcp, &req->remove_qer[i],
+                &cause_value, &offending_ie_value) == false)
+            break;
+        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+                UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
+    }
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    ogs_pfcp_handle_create_bar(&sess->pfcp, &req->create_bar,
+                &cause_value, &offending_ie_value);
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    ogs_pfcp_handle_remove_bar(&sess->pfcp, &req->remove_bar,
+            &cause_value, &offending_ie_value);
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
+        goto cleanup;
+
+    /* Setup GTP Node */
+    ogs_list_for_each(&sess->pfcp.far_list, far) {
+        if (OGS_ERROR == ogs_pfcp_setup_far_gtpu_node(far)) {
+            ogs_fatal("CHECK CONFIGURATION: upf.gtpu");
+            ogs_fatal("ogs_pfcp_setup_far_gtpu_node() failed");
+            goto cleanup;
+        }
+        if (far->gnode)
+            ogs_pfcp_far_f_teid_hash_set(far);
+    }
+
+    for (i = 0; i < num_of_created_pdr; i++) {
+        pdr = created_pdr[i];
+        ogs_assert(pdr);
+
+        /* Setup UPF-N3-TEID & QFI Hash */
+        if (pdr->f_teid_len)
+            ogs_pfcp_object_teid_hash_set(OGS_PFCP_OBJ_SESS_TYPE, pdr, false);
+    }
+
+    /* Send Buffered Packet to gNB/SGW */
+    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) { /* Downlink */
+            ogs_pfcp_send_buffered_packet(pdr);
+        }
+    }
+
+    if (ogs_pfcp_self()->up_function_features.ftup == 0)
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_modification_response(
+                xact, sess, NULL, 0));
+    else
+        ogs_assert(OGS_OK ==
+            upf_pfcp_send_session_modification_response(
+                xact, sess, created_pdr, num_of_created_pdr));
+    return;
+
+cleanup:
+    ogs_pfcp_sess_clear(&sess->pfcp);
+    ogs_pfcp_send_error_message(xact, sess ? sess->smf_n4_f_seid.seid : 0,
+            OGS_PFCP_SESSION_MODIFICATION_RESPONSE_TYPE,
+            cause_value, offending_ie_value);
+}
+
+void upf_n4_handle_session_deletion_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_deletion_request_t *req)
+{
+    ogs_pfcp_qer_t *qer = NULL;
+
+    ogs_assert(xact);
+    ogs_assert(req);
+
+    ogs_debug("Session Deletion Request");
+
+    if (!sess) {
+        ogs_error("No Context");
+        ogs_pfcp_send_error_message(xact, 0,
+                OGS_PFCP_SESSION_DELETION_RESPONSE_TYPE,
+                OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
+        return;
+    }
+    upf_pfcp_send_session_deletion_response(xact, sess);
+
+    ogs_list_for_each(&sess->pfcp.qer_list, qer) {
+        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+                UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
+    }
+    upf_sess_remove(sess);
+}
+
+void upf_n4_handle_session_report_response(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_report_response_t *rsp)
+{
+    uint8_t cause_value = 0;
+
+    ogs_assert(xact);
+    ogs_assert(rsp);
+
+    ogs_pfcp_xact_commit(xact);
+
+    ogs_debug("Session Report Response");
+
+    cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    if (!sess) {
+        ogs_warn("No Context");
+        cause_value = OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND;
+    }
+
+    if (rsp->cause.presence) {
+        if (rsp->cause.u8 != OGS_PFCP_CAUSE_REQUEST_ACCEPTED) {
+            ogs_error("PFCP Cause[%d] : Not Accepted", rsp->cause.u8);
+            cause_value = rsp->cause.u8;
+        }
+    } else {
+        ogs_error("No Cause");
+        cause_value = OGS_PFCP_CAUSE_MANDATORY_IE_MISSING;
+    }
+
+    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED) {
+        ogs_error("Cause request not accepted[%d]", cause_value);
+        return;
+    } else {
+        upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONREPORTSUCC);
+    }
+
+}
+===== n4-handler.h =====
+
+#ifndef UPF_N4_HANDLER_H
+#define UPF_N4_HANDLER_H
+
+#include "ogs-gtp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void upf_n4_handle_session_establishment_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_establishment_request_t *req);
+void upf_n4_handle_session_modification_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_modification_request_t *req);
+void upf_n4_handle_session_deletion_request(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_deletion_request_t *req);
+
+void upf_n4_handle_session_report_response(
+        upf_sess_t *sess, ogs_pfcp_xact_t *xact,
+        ogs_pfcp_session_report_response_t *rsp);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_N4_HANDLER_H */
+===== pfcp-path.c =====
+/*
+ * Copyright (C) 2019-2025 by Sukchan Lee <acetcom@gmail.com>
+ *
+ * This file is part of Open5GS.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "context.h"
+
+#include "pfcp-path.h"
+#include "n4-build.h"
+
+static void pfcp_node_fsm_init(ogs_pfcp_node_t *node, bool try_to_assoicate)
+{
+    upf_event_t e;
+
+    ogs_assert(node);
+
+    memset(&e, 0, sizeof(e));
+    e.pfcp_node = node;
+
+    if (try_to_assoicate == true) {
+        node->t_association = ogs_timer_add(ogs_app()->timer_mgr,
+                upf_timer_association, node);
+        ogs_assert(node->t_association);
+    }
+
+    ogs_fsm_init(&node->sm, upf_pfcp_state_initial, upf_pfcp_state_final, &e);
+}
+
+static void pfcp_node_fsm_fini(ogs_pfcp_node_t *node)
+{
+    upf_event_t e;
+
+    ogs_assert(node);
+
+    memset(&e, 0, sizeof(e));
+    e.pfcp_node = node;
+
+    ogs_fsm_fini(&node->sm, &e);
+
+    if (node->t_association)
+        ogs_timer_delete(node->t_association);
+}
+
+static void pfcp_recv_cb(short when, ogs_socket_t fd, void *data)
+{
+    int rv;
+
+    upf_event_t *e = NULL;
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_sockaddr_t from;
+    ogs_pfcp_node_t *node = NULL;
+    ogs_pfcp_message_t *message = NULL;
+
+    ogs_pfcp_status_e pfcp_status;;
+    ogs_pfcp_node_id_t node_id;
+
+    ogs_assert(fd != INVALID_SOCKET);
+
+    pkbuf = ogs_pfcp_recvfrom(fd, &from);
+    if (!pkbuf) {
+        ogs_error("ogs_pfcp_recvfrom() failed");
+        return;
+    }
+
+    e = upf_event_new(UPF_EVT_N4_MESSAGE);
+    ogs_assert(e);
+
+    /*
+     * Issue #1911
+     *
+     * Because ogs_pfcp_message_t is over 80kb in size,
+     * it can cause stack overflow.
+     * To avoid this, the pfcp_message structure uses heap memory.
+     */
+    if ((message = ogs_pfcp_parse_msg(pkbuf)) == NULL) {
+        ogs_error("ogs_pfcp_parse_msg() failed");
+        ogs_pkbuf_free(pkbuf);
+        upf_event_free(e);
+        return;
+    }
+
+    pfcp_status = ogs_pfcp_extract_node_id(message, &node_id);
+    switch (pfcp_status) {
+    case OGS_PFCP_STATUS_SUCCESS:
+    case OGS_PFCP_STATUS_NODE_ID_NONE:
+    case OGS_PFCP_STATUS_NODE_ID_OPTIONAL_ABSENT:
+        ogs_debug("ogs_pfcp_extract_node_id() "
+                "type [%d] pfcp_status [%d] node_id [%s] from %s",
+                message->h.type, pfcp_status,
+                pfcp_status == OGS_PFCP_STATUS_SUCCESS ?
+                    ogs_pfcp_node_id_to_string_static(&node_id) :
+                    "NULL",
+                ogs_sockaddr_to_string_static(&from));
+        break;
+
+    case OGS_PFCP_ERROR_SEMANTIC_INCORRECT_MESSAGE:
+    case OGS_PFCP_ERROR_NODE_ID_NOT_PRESENT:
+    case OGS_PFCP_ERROR_NODE_ID_NOT_FOUND:
+    case OGS_PFCP_ERROR_UNKNOWN_MESSAGE:
+        ogs_error("ogs_pfcp_extract_node_id() failed "
+                "type [%d] pfcp_status [%d] from %s",
+                message->h.type, pfcp_status,
+                ogs_sockaddr_to_string_static(&from));
+        goto cleanup;
+
+    default:
+        ogs_error("Unexpected pfcp_status "
+                "type [%d] pfcp_status [%d] from %s",
+                message->h.type, pfcp_status,
+                ogs_sockaddr_to_string_static(&from));
+        goto cleanup;
+    }
+
+    node = ogs_pfcp_node_find(&ogs_pfcp_self()->pfcp_peer_list,
+            pfcp_status == OGS_PFCP_STATUS_SUCCESS ? &node_id : NULL, &from);
+    if (!node) {
+        if (message->h.type == OGS_PFCP_ASSOCIATION_SETUP_REQUEST_TYPE ||
+            message->h.type == OGS_PFCP_ASSOCIATION_SETUP_RESPONSE_TYPE) {
+            ogs_assert(pfcp_status == OGS_PFCP_STATUS_SUCCESS);
+            node = ogs_pfcp_node_add(&ogs_pfcp_self()->pfcp_peer_list,
+                    &node_id, &from);
+            if (!node) {
+                ogs_error("No memory: ogs_pfcp_node_add() failed");
+                goto cleanup;
+            }
+            ogs_debug("Added PFCP-Node: addr_list %s",
+                    ogs_sockaddr_to_string_static(node->addr_list));
+
+            pfcp_node_fsm_init(node, false);
+
+        } else {
+            ogs_error("Cannot find PFCP-Node: type [%d] node_id %s from %s",
+                    message->h.type,
+                    pfcp_status == OGS_PFCP_STATUS_SUCCESS ?
+                        ogs_pfcp_node_id_to_string_static(&node_id) :
+                        "NULL",
+                    ogs_sockaddr_to_string_static(&from));
+            goto cleanup;
+        }
+    } else {
+        ogs_debug("Found PFCP-Node: addr_list %s",
+                ogs_sockaddr_to_string_static(node->addr_list));
+        ogs_expect(OGS_OK == ogs_pfcp_node_merge(
+                    node,
+                    pfcp_status == OGS_PFCP_STATUS_SUCCESS ?  &node_id : NULL,
+                    &from));
+        ogs_debug("Merged PFCP-Node: addr_list %s",
+                ogs_sockaddr_to_string_static(node->addr_list));
+    }
+
+    e->pfcp_node = node;
+    e->pkbuf = pkbuf;
+    e->pfcp_message = message;
+
+    rv = ogs_queue_push(ogs_app()->queue, e);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_queue_push() failed:%d", (int)rv);
+        goto cleanup;
+    }
+
+    return;
+
+cleanup:
+    ogs_pkbuf_free(pkbuf);
+    ogs_pfcp_message_free(message);
+    upf_event_free(e);
+}
+
+int upf_pfcp_open(void)
+{
+    ogs_socknode_t *node = NULL;
+    ogs_sock_t *sock = NULL;
+
+    /* PFCP Server */
+    ogs_list_for_each(&ogs_pfcp_self()->pfcp_list, node) {
+        sock = ogs_pfcp_server(node);
+        if (!sock) return OGS_ERROR;
+
+        node->poll = ogs_pollset_add(ogs_app()->pollset,
+                OGS_POLLIN, sock->fd, pfcp_recv_cb, sock);
+        ogs_assert(node->poll);
+    }
+    ogs_list_for_each(&ogs_pfcp_self()->pfcp_list6, node) {
+        sock = ogs_pfcp_server(node);
+        if (!sock) return OGS_ERROR;
+
+        node->poll = ogs_pollset_add(ogs_app()->pollset,
+                OGS_POLLIN, sock->fd, pfcp_recv_cb, sock);
+        ogs_assert(node->poll);
+    }
+
+    OGS_SETUP_PFCP_SERVER;
+
+    return OGS_OK;
+}
+
+void upf_pfcp_close(void)
+{
+    ogs_pfcp_node_t *pfcp_node = NULL;
+
+    ogs_list_for_each(&ogs_pfcp_self()->pfcp_peer_list, pfcp_node)
+        pfcp_node_fsm_fini(pfcp_node);
+
+    ogs_freeaddrinfo(ogs_pfcp_self()->pfcp_advertise);
+    ogs_freeaddrinfo(ogs_pfcp_self()->pfcp_advertise6);
+
+    ogs_socknode_remove_all(&ogs_pfcp_self()->pfcp_list);
+    ogs_socknode_remove_all(&ogs_pfcp_self()->pfcp_list6);
+}
+
+int upf_pfcp_send_session_establishment_response(
+        ogs_pfcp_xact_t *xact, upf_sess_t *sess,
+        ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr)
+{
+    int rv;
+    ogs_pkbuf_t *n4buf = NULL;
+    ogs_pfcp_header_t h;
+
+    ogs_assert(xact);
+
+    memset(&h, 0, sizeof(ogs_pfcp_header_t));
+    h.type = OGS_PFCP_SESSION_ESTABLISHMENT_RESPONSE_TYPE;
+    h.seid = sess->smf_n4_f_seid.seid;
+
+    n4buf = upf_n4_build_session_establishment_response(
+            h.type, sess, created_pdr, num_of_created_pdr);
+    if (!n4buf) {
+        ogs_error("upf_n4_build_session_establishment_response() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_update_tx(xact, &h, n4buf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_pfcp_xact_update_tx() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+int upf_pfcp_send_session_modification_response(
+        ogs_pfcp_xact_t *xact, upf_sess_t *sess,
+        ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr)
+{
+    int rv;
+    ogs_pkbuf_t *n4buf = NULL;
+    ogs_pfcp_header_t h;
+
+    ogs_assert(xact);
+
+    memset(&h, 0, sizeof(ogs_pfcp_header_t));
+    h.type = OGS_PFCP_SESSION_MODIFICATION_RESPONSE_TYPE;
+    h.seid = sess->smf_n4_f_seid.seid;
+
+    n4buf = upf_n4_build_session_modification_response(
+            h.type, sess, created_pdr, num_of_created_pdr);
+    if (!n4buf) {
+        ogs_error("upf_n4_build_session_modification_response() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_update_tx(xact, &h, n4buf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_pfcp_xact_update_tx() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+int upf_pfcp_send_session_deletion_response(ogs_pfcp_xact_t *xact,
+        upf_sess_t *sess)
+{
+    int rv;
+    ogs_pkbuf_t *n4buf = NULL;
+    ogs_pfcp_header_t h;
+
+    ogs_assert(xact);
+
+    memset(&h, 0, sizeof(ogs_pfcp_header_t));
+    h.type = OGS_PFCP_SESSION_DELETION_RESPONSE_TYPE;
+    h.seid = sess->smf_n4_f_seid.seid;
+
+    n4buf = upf_n4_build_session_deletion_response(h.type, sess);
+    if (!n4buf) {
+        ogs_error("upf_n4_build_session_deletion_response() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_update_tx(xact, &h, n4buf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_pfcp_xact_update_tx() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+static void sess_timeout(ogs_pfcp_xact_t *xact, void *data)
+{
+    upf_sess_t *sess = NULL;
+    ogs_pool_id_t sess_id = OGS_INVALID_POOL_ID;
+    uint8_t type;
+
+    ogs_assert(xact);
+    type = xact->seq[0].type;
+
+    ogs_assert(data);
+    sess_id = OGS_POINTER_TO_UINT(data);
+    ogs_assert(sess_id >= OGS_MIN_POOL_ID && sess_id <= OGS_MAX_POOL_ID);
+
+    sess = upf_sess_find_by_id(sess_id);
+    if (!sess) {
+        ogs_error("Session has already been removed [%d]", type);
+        return;
+    }
+
+    switch (type) {
+    case OGS_PFCP_SESSION_REPORT_REQUEST_TYPE:
+        ogs_error("No PFCP session report response");
+        break;
+    default:
+        ogs_error("Not implemented [type:%d]", type);
+        break;
+    }
+}
+
+int upf_pfcp_send_session_report_request(
+        upf_sess_t *sess, ogs_pfcp_user_plane_report_t *report)
+{
+    int rv;
+    ogs_pkbuf_t *n4buf = NULL;
+    ogs_pfcp_header_t h;
+    ogs_pfcp_xact_t *xact = NULL;
+
+    upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONREPORT);
+
+    ogs_assert(sess);
+    ogs_assert(report);
+
+    memset(&h, 0, sizeof(ogs_pfcp_header_t));
+    h.type = OGS_PFCP_SESSION_REPORT_REQUEST_TYPE;
+    h.seid = sess->smf_n4_f_seid.seid;
+
+    xact = ogs_pfcp_xact_local_create(
+            sess->pfcp_node, sess_timeout, OGS_UINT_TO_POINTER(sess->id));
+    if (!xact) {
+        ogs_error("ogs_pfcp_xact_local_create() failed");
+        return OGS_ERROR;
+    }
+
+    n4buf = ogs_pfcp_build_session_report_request(h.type, report);
+    if (!n4buf) {
+        ogs_error("ogs_pfcp_build_session_report_request() failed");
+        return OGS_ERROR;
+    }
+
+    rv = ogs_pfcp_xact_update_tx(xact, &h, n4buf);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_pfcp_xact_update_tx() failed");
+        return OGS_ERROR;
+    }
+
+
+    rv = ogs_pfcp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+===== pfcp-path.h =====
+
+#ifndef UPF_PFCP_PATH_H
+#define UPF_PFCP_PATH_H
+
+#include "ogs-gtp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int upf_pfcp_open(void);
+void upf_pfcp_close(void);
+
+int upf_pfcp_send_session_establishment_response(
+        ogs_pfcp_xact_t *xact, upf_sess_t *sess,
+        ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr);
+int upf_pfcp_send_session_modification_response(
+        ogs_pfcp_xact_t *xact, upf_sess_t *sess,
+        ogs_pfcp_pdr_t *created_pdr[], int num_of_created_pdr);
+int upf_pfcp_send_session_deletion_response(ogs_pfcp_xact_t *xact,
+        upf_sess_t *sess);
+
+int upf_pfcp_send_session_report_request(
+        upf_sess_t *sess, ogs_pfcp_user_plane_report_t *report);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_PFCP_PATH_H */
+===== pfcp-sm.c =====
+
+#include "context.h"
+#include "event.h"
+#include "timer.h"
+#include "upf-sm.h"
+
+#include "pfcp-path.h"
+#include "n4-handler.h"
+
+static void pfcp_restoration(ogs_pfcp_node_t *node);
+static void node_timeout(ogs_pfcp_xact_t *xact, void *data);
+
+void upf_pfcp_state_initial(ogs_fsm_t *s, upf_event_t *e)
+{
+    ogs_pfcp_node_t *node = NULL;
+
+    ogs_assert(s);
+    ogs_assert(e);
+
+    upf_sm_debug(e);
+
+    node = e->pfcp_node;
+    ogs_assert(node);
+
+    node->t_no_heartbeat = ogs_timer_add(ogs_app()->timer_mgr,
+            upf_timer_no_heartbeat, node);
+    ogs_assert(node->t_no_heartbeat);
+
+    OGS_FSM_TRAN(s, &upf_pfcp_state_will_associate);
+}
+
+void upf_pfcp_state_final(ogs_fsm_t *s, upf_event_t *e)
+{
+    ogs_pfcp_node_t *node = NULL;
+    ogs_assert(s);
+    ogs_assert(e);
+
+    upf_sm_debug(e);
+
+    node = e->pfcp_node;
+    ogs_assert(node);
+
+    ogs_timer_delete(node->t_no_heartbeat);
+}
+
+void upf_pfcp_state_will_associate(ogs_fsm_t *s, upf_event_t *e)
+{
+    ogs_pfcp_node_t *node = NULL;
+    ogs_pfcp_xact_t *xact = NULL;
+    ogs_pfcp_message_t *message = NULL;
+    ogs_assert(s);
+    ogs_assert(e);
+
+    upf_sm_debug(e);
+
+    node = e->pfcp_node;
+    ogs_assert(node);
+
+    switch (e->id) {
+    case OGS_FSM_ENTRY_SIG:
+        if (node->t_association) {
+            ogs_timer_start(node->t_association,
+                ogs_local_conf()->time.message.pfcp.association_interval);
+
+            ogs_pfcp_up_send_association_setup_request(node, node_timeout);
+        }
+        break;
+
+    case OGS_FSM_EXIT_SIG:
+        if (node->t_association) {
+            ogs_timer_stop(node->t_association);
+        }
+        break;
+
+    case UPF_EVT_N4_TIMER:
+        switch(e->timer_id) {
+        case UPF_TIMER_ASSOCIATION:
+            ogs_warn("Retry association with peer failed %s",
+                    ogs_sockaddr_to_string_static(node->addr_list));
+
+            ogs_assert(node->t_association);
+            ogs_timer_start(node->t_association,
+                ogs_local_conf()->time.message.pfcp.association_interval);
+
+            ogs_pfcp_up_send_association_setup_request(node, node_timeout);
+            break;
+        default:
+            ogs_error("Unknown timer[%s:%d]",
+                    upf_timer_get_name(e->timer_id), e->timer_id);
+            break;
+        }
+        break;
+    case UPF_EVT_N4_MESSAGE:
+        message = e->pfcp_message;
+        ogs_assert(message);
+        xact = ogs_pfcp_xact_find_by_id(e->pfcp_xact_id);
+        ogs_assert(xact);
+
+        switch (message->h.type) {
+        case OGS_PFCP_HEARTBEAT_REQUEST_TYPE:
+            ogs_expect(true ==
+                ogs_pfcp_handle_heartbeat_request(node, xact,
+                    &message->pfcp_heartbeat_request));
+            break;
+        case OGS_PFCP_HEARTBEAT_RESPONSE_TYPE:
+            ogs_expect(true ==
+                ogs_pfcp_handle_heartbeat_response(node, xact,
+                    &message->pfcp_heartbeat_response));
+            break;
+        case OGS_PFCP_ASSOCIATION_SETUP_REQUEST_TYPE:
+            ogs_pfcp_up_handle_association_setup_request(node, xact,
+                    &message->pfcp_association_setup_request);
+            OGS_FSM_TRAN(s, upf_pfcp_state_associated);
+            break;
+        case OGS_PFCP_ASSOCIATION_SETUP_RESPONSE_TYPE:
+            ogs_pfcp_up_handle_association_setup_response(node, xact,
+                    &message->pfcp_association_setup_response);
+            OGS_FSM_TRAN(s, upf_pfcp_state_associated);
+            break;
+        default:
+            ogs_warn("cannot handle PFCP message type[%d]",
+                    message->h.type);
+            break;
+        }
+        break;
+    default:
+        ogs_error("Unknown event %s", upf_event_get_name(e));
+        break;
+    }
+}
+
+void upf_pfcp_state_associated(ogs_fsm_t *s, upf_event_t *e)
+{
+    ogs_pfcp_node_t *node = NULL;
+    ogs_pfcp_xact_t *xact = NULL;
+    ogs_pfcp_message_t *message = NULL;
+
+    upf_sess_t *sess = NULL;
+
+    ogs_assert(s);
+    ogs_assert(e);
+
+    upf_sm_debug(e);
+
+    node = e->pfcp_node;
+    ogs_assert(node);
+
+    switch (e->id) {
+    case OGS_FSM_ENTRY_SIG:
+        ogs_info("PFCP associated %s",
+                ogs_sockaddr_to_string_static(node->addr_list));
+        ogs_timer_start(node->t_no_heartbeat,
+                ogs_local_conf()->time.message.pfcp.no_heartbeat_duration);
+        ogs_assert(OGS_OK ==
+            ogs_pfcp_send_heartbeat_request(node, node_timeout));
+
+        if (node->restoration_required == true) {
+            pfcp_restoration(node);
+            node->restoration_required = false;
+            ogs_error("PFCP restoration");
+        }
+
+        upf_metrics_inst_global_inc(UPF_METR_GLOB_GAUGE_PFCP_PEERS_ACTIVE);
+        break;
+    case OGS_FSM_EXIT_SIG:
+        ogs_info("PFCP de-associated %s",
+                ogs_sockaddr_to_string_static(node->addr_list));
+        ogs_timer_stop(node->t_no_heartbeat);
+
+        upf_metrics_inst_global_dec(UPF_METR_GLOB_GAUGE_PFCP_PEERS_ACTIVE);
+        break;
+    case UPF_EVT_N4_MESSAGE:
+        message = e->pfcp_message;
+        ogs_assert(message);
+        xact = ogs_pfcp_xact_find_by_id(e->pfcp_xact_id);
+        ogs_assert(xact);
+
+        if (message->h.seid_presence && message->h.seid != 0)
+            sess = upf_sess_find_by_upf_n4_seid(message->h.seid);
+
+        switch (message->h.type) {
+        case OGS_PFCP_HEARTBEAT_REQUEST_TYPE:
+            ogs_expect(true ==
+                ogs_pfcp_handle_heartbeat_request(node, xact,
+                    &message->pfcp_heartbeat_request));
+            if (node->restoration_required == true) {
+                if (node->t_association) {
+        /*
+         * node->t_association that the PFCP entity attempts an association.
+         *
+         * In this case, even if Remote PFCP entity is restarted,
+         * PFCP restoration must be performed after PFCP association.
+         *
+         * Otherwise, Session related PFCP cannot be initiated
+         * because the peer PFCP entity is in a de-associated state.
+         */
+                    OGS_FSM_TRAN(s, upf_pfcp_state_will_associate);
+                } else {
+
+        /*
+         * If the peer PFCP entity is performing the association,
+         * Restoration can be performed immediately.
+         */
+                    pfcp_restoration(node);
+                    node->restoration_required = false;
+                    ogs_error("PFCP restoration");
+                }
+            }
+            break;
+        case OGS_PFCP_HEARTBEAT_RESPONSE_TYPE:
+            ogs_expect(true ==
+                ogs_pfcp_handle_heartbeat_response(node, xact,
+                    &message->pfcp_heartbeat_response));
+            if (node->restoration_required == true) {
+        /*
+         * node->t_association that the PFCP entity attempts an association.
+         *
+         * In this case, even if Remote PFCP entity is restarted,
+         * PFCP restoration must be performed after PFCP association.
+         *
+         * Otherwise, Session related PFCP cannot be initiated
+         * because the peer PFCP entity is in a de-associated state.
+         */
+                if (node->t_association) {
+                    OGS_FSM_TRAN(s, upf_pfcp_state_will_associate);
+                } else {
+        /*
+         * If the peer PFCP entity is performing the association,
+         * Restoration can be performed immediately.
+         */
+                    pfcp_restoration(node);
+                    node->restoration_required = false;
+                    ogs_error("PFCP restoration");
+                }
+            }
+            break;
+        case OGS_PFCP_ASSOCIATION_SETUP_REQUEST_TYPE:
+            ogs_warn("PFCP[REQ] has already been associated %s",
+                    ogs_sockaddr_to_string_static(node->addr_list));
+            ogs_pfcp_up_handle_association_setup_request(node, xact,
+                    &message->pfcp_association_setup_request);
+            break;
+        case OGS_PFCP_ASSOCIATION_SETUP_RESPONSE_TYPE:
+            ogs_warn("PFCP[RSP] has already been associated %s",
+                    ogs_sockaddr_to_string_static(node->addr_list));
+            ogs_pfcp_up_handle_association_setup_response(node, xact,
+                    &message->pfcp_association_setup_response);
+            break;
+        case OGS_PFCP_SESSION_ESTABLISHMENT_REQUEST_TYPE:
+            sess = upf_sess_add_by_message(message);
+            if (sess)
+                OGS_SETUP_PFCP_NODE(sess, node);
+            upf_n4_handle_session_establishment_request(
+                sess, xact, &message->pfcp_session_establishment_request);
+            break;
+        case OGS_PFCP_SESSION_MODIFICATION_REQUEST_TYPE:
+            upf_n4_handle_session_modification_request(
+                sess, xact, &message->pfcp_session_modification_request);
+            break;
+        case OGS_PFCP_SESSION_DELETION_REQUEST_TYPE:
+            upf_n4_handle_session_deletion_request(
+                sess, xact, &message->pfcp_session_deletion_request);
+            break;
+        case OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE:
+            upf_n4_handle_session_report_response(
+                sess, xact, &message->pfcp_session_report_response);
+            break;
+        default:
+            ogs_error("Not implemented PFCP message type[%d]",
+                    message->h.type);
+            break;
+        }
+
+        break;
+    case UPF_EVT_N4_TIMER:
+        switch(e->timer_id) {
+        case UPF_TIMER_NO_HEARTBEAT:
+            node = e->pfcp_node;
+            ogs_assert(node);
+
+            ogs_assert(OGS_OK ==
+                ogs_pfcp_send_heartbeat_request(node, node_timeout));
+            break;
+        default:
+            ogs_error("Unknown timer[%s:%d]",
+                    upf_timer_get_name(e->timer_id), e->timer_id);
+            break;
+        }
+        break;
+    case UPF_EVT_N4_NO_HEARTBEAT:
+        ogs_warn("No Heartbeat from SMF %s",
+                ogs_sockaddr_to_string_static(node->addr_list));
+        OGS_FSM_TRAN(s, upf_pfcp_state_will_associate);
+        break;
+    default:
+        ogs_error("Unknown event %s", upf_event_get_name(e));
+        break;
+    }
+}
+
+void upf_pfcp_state_exception(ogs_fsm_t *s, upf_event_t *e)
+{
+    ogs_assert(s);
+    ogs_assert(e);
+
+    upf_sm_debug(e);
+
+    switch (e->id) {
+    case OGS_FSM_ENTRY_SIG:
+        break;
+    case OGS_FSM_EXIT_SIG:
+        break;
+    default:
+        ogs_error("Unknown event %s", upf_event_get_name(e));
+        break;
+    }
+}
+
+static void pfcp_restoration(ogs_pfcp_node_t *node)
+{
+    upf_sess_t *sess = NULL, *next = NULL;
+    char buf1[OGS_ADDRSTRLEN];
+    char buf2[OGS_ADDRSTRLEN];
+
+    ogs_list_for_each_safe(&upf_self()->sess_list, next, sess) {
+        if (node == sess->pfcp_node) {
+            ogs_info("DELETION: F-SEID[UP:0x%lx CP:0x%lx] IPv4[%s] IPv6[%s]",
+                (long)sess->upf_n4_seid, (long)sess->smf_n4_f_seid.seid,
+                sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
+                sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "");
+            upf_sess_remove(sess);
+        }
+    }
+}
+
+static void node_timeout(ogs_pfcp_xact_t *xact, void *data)
+{
+    int rv;
+
+    upf_event_t *e = NULL;
+    uint8_t type;
+
+    ogs_assert(xact);
+    type = xact->seq[0].type;
+
+    switch (type) {
+    case OGS_PFCP_HEARTBEAT_REQUEST_TYPE:
+        ogs_assert(data);
+
+        e = upf_event_new(UPF_EVT_N4_NO_HEARTBEAT);
+        e->pfcp_node = data;
+
+        rv = ogs_queue_push(ogs_app()->queue, e);
+        if (rv != OGS_OK) {
+            ogs_error("ogs_queue_push() failed:%d", (int)rv);
+            upf_event_free(e);
+        }
+        break;
+    case OGS_PFCP_ASSOCIATION_SETUP_REQUEST_TYPE:
+        break;
+    default:
+        ogs_error("Not implemented [type:%d]", type);
+        break;
+    }
+}
+===== rule-match.c =====
+
+#define _DEFAULT_SOURCE 1
+#define _BSD_SOURCE     1
+
+#include "rule-match.h"
+
+#if HAVE_NETINET_IP_H
+#include <netinet/ip.h>
+#endif
+
+#if HAVE_NETINET_IP6_H
+#include <netinet/ip6.h>
+#endif
+
+upf_sess_t *upf_sess_find_by_ue_ip_address(ogs_pkbuf_t *pkbuf)
+{
+    upf_sess_t *sess = NULL;
+
+    char buf[OGS_ADDRSTRLEN];
+
+    struct ip *ip_h = NULL;
+    struct ip6_hdr *ip6_h = NULL;
+
+    ogs_assert(pkbuf);
+    ogs_assert(pkbuf->len);
+    ogs_assert(pkbuf->data);
+
+    ip_h = (struct ip *)pkbuf->data;
+    if (ip_h->ip_v == 4) {
+        ip_h = (struct ip *)pkbuf->data;
+        sess = upf_sess_find_by_ipv4(ip_h->ip_dst.s_addr);
+    } else if (ip_h->ip_v == 6) {
+        ip6_h = (struct ip6_hdr *)pkbuf->data;
+        sess = upf_sess_find_by_ipv6((uint32_t *)ip6_h->ip6_dst.s6_addr);
+    } else {
+        ogs_error("Invalid packet [IP version:%d, Packet Length:%d]",
+                ip_h->ip_v, pkbuf->len);
+        ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
+    }
+
+    if (sess) {
+        if (ip_h && sess->ipv4)
+            ogs_trace("PAA IPv4:%s", OGS_INET_NTOP(&sess->ipv4->addr, buf));
+        if (ip6_h && sess->ipv6)
+            ogs_trace("PAA IPv6:%s", OGS_INET6_NTOP(&sess->ipv6->addr, buf));
+    }
+
+    return sess;
+}
+===== rule-match.h =====
+
+#ifndef UPF_RULE_MATCH_H
+#define UPF_RULE_MATCH_H
+
+#include "context.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+upf_sess_t *upf_sess_find_by_ue_ip_address(ogs_pkbuf_t *pkbuf);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_RULE_MATCH_H */
+===== timer.c =====
+
+#include "timer.h"
+#include "event.h"
+#include "context.h"
+
+const char *upf_timer_get_name(upf_timer_e id)
+{
+    switch (id) {
+    case UPF_TIMER_ASSOCIATION:
+        return "UPF_TIMER_ASSOCIATION";
+    case UPF_TIMER_NO_HEARTBEAT:
+        return "UPF_TIMER_NO_HEARTBEAT";
+    default: 
+       break;
+    }
+
+    return "UNKNOWN_TIMER";
+}
+
+static void timer_send_event(int timer_id, void *data)
+{
+    int rv;
+    upf_event_t *e = NULL;
+    ogs_assert(data);
+
+    e = upf_event_new(UPF_EVT_N4_TIMER);
+    e->timer_id = timer_id;
+    e->pfcp_node = data;
+
+    rv = ogs_queue_push(ogs_app()->queue, e);
+    if (rv != OGS_OK) {
+        ogs_error("ogs_queue_push() failed:%d", (int)rv);
+        upf_event_free(e);
+    }
+}
+
+void upf_timer_association(void *data)
+{
+    timer_send_event(UPF_TIMER_ASSOCIATION, data);
+}
+
+void upf_timer_no_heartbeat(void *data)
+{
+    timer_send_event(UPF_TIMER_NO_HEARTBEAT, data);
+}
+===== timer.h =====
+
+#ifndef UPF_TIMER_H
+#define UPF_TIMER_H
+
+#include "ogs-core.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* forward declaration */
+typedef enum {
+    UPF_TIMER_BASE = 0,
+
+    UPF_TIMER_ASSOCIATION,
+    UPF_TIMER_NO_HEARTBEAT,
+
+    MAX_NUM_OF_UPF_TIMER,
+
+} upf_timer_e;
+
+const char *upf_timer_get_name(upf_timer_e id);
+
+void upf_timer_association(void *data);
+void upf_timer_no_heartbeat(void *data);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_TIMER_H */
+===== upf-sm.c =====
+
+#include "upf-sm.h"
+#include "context.h"
+#include "event.h"
+#include "pfcp-path.h"
+#include "gtp-path.h"
+
+void upf_state_initial(ogs_fsm_t *s, upf_event_t *e)
+{
+    upf_sm_debug(e);
+
+    ogs_assert(s);
+
+    OGS_FSM_TRAN(s, &upf_state_operational);
+}
+
+void upf_state_final(ogs_fsm_t *s, upf_event_t *e)
+{
+    upf_sm_debug(e);
+
+    ogs_assert(s);
+}
+
+void upf_state_operational(ogs_fsm_t *s, upf_event_t *e)
+{
+    int rv;
+    ogs_pkbuf_t *recvbuf = NULL;
+
+    ogs_pfcp_message_t *pfcp_message = NULL;
+    ogs_pfcp_node_t *node = NULL;
+    ogs_pfcp_xact_t *xact = NULL;
+
+    upf_sm_debug(e);
+
+    ogs_assert(s);
+
+    switch (e->id) {
+    case OGS_FSM_ENTRY_SIG:
+        break;
+
+    case OGS_FSM_EXIT_SIG:
+        break;
+
+    case UPF_EVT_N4_MESSAGE:
+        ogs_assert(e);
+        recvbuf = e->pkbuf;
+        ogs_assert(recvbuf);
+        pfcp_message = e->pfcp_message;
+        ogs_assert(pfcp_message);
+        node = e->pfcp_node;
+        ogs_assert(node);
+        ogs_assert(OGS_FSM_STATE(&node->sm));
+
+        rv = ogs_pfcp_xact_receive(node, &pfcp_message->h, &xact);
+        if (rv != OGS_OK) {
+            ogs_pkbuf_free(recvbuf);
+            ogs_pfcp_message_free(pfcp_message);
+            break;
+        }
+
+        e->pfcp_xact_id = xact ? xact->id : OGS_INVALID_POOL_ID;
+        ogs_fsm_dispatch(&node->sm, e);
+        if (OGS_FSM_CHECK(&node->sm, upf_pfcp_state_exception)) {
+            ogs_error("PFCP state machine exception");
+        }
+
+        ogs_pkbuf_free(recvbuf);
+        ogs_pfcp_message_free(pfcp_message);
+        break;
+    case UPF_EVT_N4_TIMER:
+    case UPF_EVT_N4_NO_HEARTBEAT:
+        node = e->pfcp_node;
+        ogs_assert(node);
+        ogs_assert(OGS_FSM_STATE(&node->sm));
+
+        ogs_fsm_dispatch(&node->sm, e);
+        break;
+    default:
+        ogs_error("No handler for event %s", upf_event_get_name(e));
+        break;
+    }
+}
+===== upf-sm.h =====
+
+#ifndef UPF_SM_H
+#define UPF_SM_H
+
+#include "event.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void upf_state_initial(ogs_fsm_t *s, upf_event_t *e);
+void upf_state_final(ogs_fsm_t *s, upf_event_t *e);
+void upf_state_operational(ogs_fsm_t *s, upf_event_t *e);
+void upf_state_exception(ogs_fsm_t *s, upf_event_t *e);
+
+void upf_pfcp_state_initial(ogs_fsm_t *s, upf_event_t *e);
+void upf_pfcp_state_final(ogs_fsm_t *s, upf_event_t *e);
+void upf_pfcp_state_will_associate(ogs_fsm_t *s, upf_event_t *e);
+void upf_pfcp_state_associated(ogs_fsm_t *s, upf_event_t *e);
+void upf_pfcp_state_exception(ogs_fsm_t *s, upf_event_t *e);
+
+#define upf_sm_debug(__pe) \
+    ogs_debug("%s(): %s", __func__, upf_event_get_name(__pe))
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* UPF_SM_H */

@@ -1,0 +1,76 @@
+typedef struct ogs_pfcp_pdr_s {
+    ogs_pfcp_object_t       obj;
+
+    ogs_pool_id_t           *teid_node;  /* A node of TEID */
+    ogs_pool_id_t           teid;
+
+    ogs_lnode_t             to_create_node;
+    ogs_lnode_t             to_modify_node;
+
+    struct {
+        struct {
+            int len;
+            uint32_t key;
+        } teid;
+    } hash;
+
+    uint8_t                 *id_node;      /* Pool-Node for ID */
+    ogs_pfcp_pdr_id_t       id;
+    ogs_pfcp_precedence_t   precedence;
+    ogs_pfcp_interface_t    src_if;
+
+    bool src_if_type_presence;
+    ogs_pfcp_3gpp_interface_type_t src_if_type;
+
+    union {
+        char *apn;
+        char *dnn;
+    };
+
+    ogs_pfcp_ue_ip_addr_t   ue_ip_addr;
+    int                     ue_ip_addr_len;
+
+    char                    **ipv4_framed_routes;
+    char                    **ipv6_framed_routes;
+
+    ogs_pfcp_f_teid_t       f_teid;
+    int                     f_teid_len;
+
+    bool                    chid;
+    uint8_t                 choose_id;
+
+    ogs_pfcp_outer_header_removal_t outer_header_removal;
+    int                     outer_header_removal_len;
+
+    uint8_t                 qfi;
+
+    ogs_pfcp_far_t          *far;
+
+    int                     num_of_urr;
+    ogs_pfcp_urr_t          *urr[OGS_MAX_NUM_OF_URR];
+
+    ogs_pfcp_qer_t          *qer;
+
+    int                     num_of_flow;
+    struct {
+        union {
+            struct {
+    ED6(uint8_t     spare1:3;,
+        uint8_t     bid:1;,
+        uint8_t     fl:1;,
+        uint8_t     spi:1;,
+        uint8_t     ttc:1;,
+        uint8_t     fd:1;)
+            };
+            uint8_t flags;
+        };
+        char *description;
+        uint32_t sdf_filter_id;
+    } flow[OGS_MAX_NUM_OF_FLOW_IN_PDR];;
+
+    ogs_list_t              rule_list;      /* Rule List */
+
+    /* Related Context */
+    ogs_pfcp_sess_t         *sess;
+    void                    *gnode;         /* For CP-Function */
+} ogs_pfcp_pdr_t;

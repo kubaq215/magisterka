@@ -22,6 +22,14 @@
 #include "gtp-path.h"
 #include "n4-handler.h"
 
+static char* ip_to_str(uint32_t ip) {
+    static char str[INET_ADDRSTRLEN];
+    struct in_addr addr;
+    addr.s_addr = ip;
+    inet_ntop(AF_INET, &addr, str, INET_ADDRSTRLEN);
+    return str;
+}
+
 static void upf_n4_handle_create_urr(upf_sess_t *sess, ogs_pfcp_tlv_create_urr_t *create_urr_arr,
                               uint8_t *cause_value, uint8_t *offending_ie_value)
 {
@@ -201,6 +209,14 @@ void upf_n4_handle_session_establishment_request(
             if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
                 goto cleanup;
         }
+
+        char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);
+
+        /* Print data */
+        ogs_info("PDR[%d] TEID[%d] TEID-IP[%s] UE-IP[%s] DNN[%s] ",
+                 pdr->id, pdr->teid, teid_ipv4_addr,
+                 pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
+                 sess->apn_dnn ? sess->apn_dnn : ""); 
 
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)

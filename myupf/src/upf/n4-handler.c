@@ -218,6 +218,8 @@ void upf_n4_handle_session_establishment_request(
                  pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
                  sess->apn_dnn ? sess->apn_dnn : ""); 
 
+        ogs_info("połączono");
+
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)
             ogs_pfcp_object_teid_hash_set(
@@ -461,6 +463,8 @@ void upf_n4_handle_session_deletion_request(
     ogs_assert(req);
 
     ogs_debug("Session Deletion Request");
+
+    ogs_info("rozłączono");
 
     if (!sess) {
         ogs_error("No Context");

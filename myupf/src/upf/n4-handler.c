@@ -224,9 +224,9 @@ void upf_n4_handle_session_establishment_request(
 
         /*char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);*/
 
-        ogs_info("------------------ PDR[%d] -----------------",
-            pdr->id);
-        ogs_info("Precendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%d]",
+        ogs_info(
+            "------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%d]",
+            pdr->id,
             pdr->precedence,
             interface_name(pdr->src_if),
             pdr->far ? pdr->far->id : 0,

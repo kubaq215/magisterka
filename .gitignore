@@ -1,2 +1,6 @@
 myupf/build
 myupf/install
+myupf/subprojects/freeDiameter/
+myupf/subprojects/libtins/
+myupf/subprojects/prometheus-client-c/
+myupf/subprojects/usrsctp/

@@ -1,0 +1,254 @@
+###[ PFCP Session Establishment Request ]### 
+     \IE_list   \
+      |###[ IE Node ID ]### ----------- SMF IP
+      |  id_type   = IPv4
+      |  ipv4      = 192.168.50.11
+      |###[ IE F-SEID ]### ----------- SMF IP + Session ID
+      |  seid      = 0xf2c
+      |  ipv4      = 192.168.50.11
+================================================================
+-------------------------- PDR 1 -------------------------------
+================================================================
+      |###[ IE Create PDR ]###
+      |  \IE_list   \
+      |   |###[ IE PDR ID ]### 
+      |   |  ietype    = PDR ID
+      |   |  id        = 1
+      |   |###[ IE Precedence ]### 
+      |   |  ietype    = Precedence
+      |   |  precedence= 255
+      |   |###[ IE PDI ]### 
+      |   |  \IE_list   \
+      |   |   |###[ IE Source Interface ]### 
+      |   |   |  ietype    = Source Interface
+      |   |   |  interface = Core
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+      |   |   |###[ IE UE IP Address ]### 
+      |   |   |  ietype    = UE IP Address
+      |   |   |  ipv4      = 10.45.0.12
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 1
+================================================================
+-------------------------- PDR 2 -------------------------------
+================================================================
+      |###[ IE Create PDR ]###
+      |  \IE_list   \
+      |   |###[ IE PDR ID ]### 
+      |   |  ietype    = PDR ID
+      |   |  id        = 2
+      |   |###[ IE Precedence ]### 
+      |   |  ietype    = Precedence
+      |   |  precedence= 255
+      |   |###[ IE PDI ]### 
+      |   |  \IE_list   \
+      |   |   |###[ IE Source Interface ]### 
+      |   |   |  ietype    = Source Interface
+      |   |   |  interface = Access
+      |   |   |###[ IE F-TEID ]### 
+      |   |   |  ietype    = F-TEID
+      |   |   |  CHID      = 1
+      |   |   |  CH        = 1
+      |   |   |  V6        = 1
+      |   |   |  choose_id = 5
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+      |   |   |###[ IE UE IP Address ]### 
+      |   |   |  ietype    = UE IP Address
+      |   |   |  SD        = 0
+      |   |   |  ipv4      = 10.45.0.12
+      |   |###[ IE Outer Header Removal ]### 
+      |   |  ietype    = Outer Header Removal
+      |   |  header    = GTP-U/UDP/IPv4
+      |   |  pdu_session_container= 1
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 2
+================================================================
+-------------------------- PDR 3 -------------------------------
+================================================================
+      |###[ IE Create PDR ]###
+      |  length    = 62
+      |  \IE_list   \
+      |   |###[ IE PDR ID ]### 
+      |   |  ietype    = PDR ID
+      |   |  id        = 3
+      |   |###[ IE Precedence ]### 
+      |   |  ietype    = Precedence
+      |   |  precedence= 1000
+      |   |###[ IE PDI ]### 
+      |   |  \IE_list   \
+      |   |   |###[ IE Source Interface ]### 
+      |   |   |  ietype    = Source Interface
+      |   |   |  interface = CP-function
+      |   |   |###[ IE F-TEID ]### 
+      |   |   |  ietype    = F-TEID
+      |   |   |  CHID      = 0
+      |   |   |  CH        = 1
+      |   |   |  V6        = 1
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+      |   |###[ IE Outer Header Removal ]### 
+      |   |  ietype    = Outer Header Removal
+      |   |  header    = GTP-U/UDP/IPv4
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 1
+================================================================
+-------------------------- PDR 4 -------------------------------
+================================================================
+      |###[ IE Create PDR ]### 
+      |  \IE_list   \
+      |   |###[ IE PDR ID ]### 
+      |   |  ietype    = PDR ID
+      |   |  id        = 4
+      |   |###[ IE Precedence ]### 
+      |   |  ietype    = Precedence
+      |   |  precedence= 1
+      |   |###[ IE PDI ]### 
+      |   |  \IE_list   \
+      |   |   |###[ IE Source Interface ]### 
+      |   |   |  ietype    = Source Interface
+      |   |   |  interface = Access
+      |   |   |###[ IE F-TEID ]### 
+      |   |   |  ietype    = F-TEID
+      |   |   |  CHID      = 1
+      |   |   |  CH        = 1
+      |   |   |  V6        = 1
+      |   |   |  choose_id = 5
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+      |   |   |###[ IE SDF Filter ]### 
+      |   |   |  ietype    = SDF Filter
+      |   |   |  BID       = 0
+      |   |   |  FL        = 0
+      |   |   |  SPI       = 0
+      |   |   |  TTC       = 0
+      |   |   |  FD        = 1
+      |   |   |  spare_oct = 0
+      |   |   |  flow_description_length= 42
+      |   |   |  flow_description= 'permit out 58 from ff02::2/128 to assigned'
+      |   |###[ IE Outer Header Removal ]### 
+      |   |  ietype    = Outer Header Removal
+      |   |  header    = GTP-U/UDP/IPv4
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 3
+================================================================
+-------------------------- FAR 1 -------------------------------
+================================================================
+      |###[ IE Create FAR ]###
+      |  \IE_list   \
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 1
+      |   |###[ IE Apply Action ]### 
+      |   |  ietype    = Apply Action      |   |  DUPL      = 0
+      |   |  NOCP      = 1
+      |   |  BUFF      = 1
+      |   |  FORW      = 0
+      |   |  DROP      = 0
+      |   |  extra_data= '\x00'
+      |   |###[ IE BAR ID ]### 
+      |   |  ietype    = BAR ID
+      |   |  id        = 1
+================================================================
+-------------------------- FAR 2 -------------------------------
+================================================================
+      |###[ IE Create FAR ]### 
+      |  \IE_list   \
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 2
+      |   |###[ IE Apply Action ]### 
+      |   |  ietype    = Apply Action      |   |  DUPL      = 0
+      |   |  NOCP      = 0
+      |   |  BUFF      = 0
+      |   |  FORW      = 1
+      |   |  DROP      = 0
+      |   |  extra_data= '\x00'
+      |   |###[ IE Forwarding Parameters ]### 
+      |   |  ietype    = Forwarding Parameters
+      |   |  \IE_list   \
+      |   |   |###[ IE Destination Interface ]### 
+      |   |   |  ietype    = Destination Interface
+      |   |   |  interface = Core
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+================================================================
+-------------------------- FAR 3 -------------------------------
+================================================================
+      |###[ IE Create FAR ]###
+      |  \IE_list   \
+      |   |###[ IE FAR ID ]### 
+      |   |  ietype    = FAR ID
+      |   |  id        = 3
+      |   |###[ IE Apply Action ]### 
+      |   |  ietype    = Apply Action      |   |  DUPL      = 0
+      |   |  NOCP      = 0
+      |   |  BUFF      = 0
+      |   |  FORW      = 1
+      |   |  DROP      = 0
+      |   |  extra_data= '\x00'
+      |   |###[ IE Forwarding Parameters ]### 
+      |   |  ietype    = Forwarding Parameters
+      |   |  \IE_list   \
+      |   |   |###[ IE Destination Interface ]### 
+      |   |   |  ietype    = Destination Interface
+      |   |   |  interface = CP-function
+      |   |   |###[ IE Network Instance ]### 
+      |   |   |  ietype    = Network Instance
+      |   |   |  instance  = 'internet'
+      |   |   |###[ IE Outer Header Creation ]### 
+      |   |   |  ietype    = Outer Header Creation0
+      |   |   |  STAG      = 0
+      |   |   |  CTAG      = 0
+      |   |   |  IPV6      = 0
+      |   |   |  IPV4      = 0
+      |   |   |  UDPIPV6   = 0
+      |   |   |  UDPIPV4   = 0
+      |   |   |  GTPUUDPIPV6= 0
+      |   |   |  GTPUUDPIPV4= 1
+      |   |   |  spare     = 0
+      |   |   |  TEID      = 0xb
+      |   |   |  ipv4      = 192.168.50.11
+      |###[ IE Create BAR ]### 
+      |  ietype    = Create BAR
+      |  length    = 5
+      |  \IE_list   \
+      |   |###[ IE BAR ID ]### 
+      |   |  ietype    = BAR ID
+      |   |  id        = 1
+      |###[ IE PDN Type ]### 
+      |  ietype    = PDN Type
+      |  length    = 1
+      |  spare     = 0x0
+      |  pdn_type  = IPv6
+      |  extra_data= ''
+      |###[ IE User ID ]### 
+      |  ietype    = User ID
+      |  length    = 19
+      |  spare     = 0x0
+      |  NAIF      = 0
+      |  MSISDNF   = 0
+      |  IMEIF     = 1
+      |  IMSIF     = 1
+      |  imsi_length= 8
+      |  imsi      = '\\x99y\x00\x00\x00\x00\x00\\xf1'
+      |  imei_length= 8
+      |  imei      = '4\x07\x18\x16R\x18\x16\x15'
+      |  extra_data= ''
+      |###[ IE APN/DNN ]### 
+      |  ietype    = APN/DNN
+      |  length    = 9
+      |  apn_dnn   = 'internet'
+      |###[ IE not implemented ]### 
+      |  ietype    = 257
+      |  length    = 4
+      |  data      = '\x01\\xff\\xff\\xff'

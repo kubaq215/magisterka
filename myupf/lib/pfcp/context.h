@@ -134,7 +134,7 @@ typedef enum {
 } ogs_pfcp_object_type_e;
 
 typedef struct ogs_pfcp_object_s {
-    ogs_lnode_t lnode;
+    ogs_lnode_t lnode; /* A node of list_t */
     ogs_pfcp_object_type_e type;
 } ogs_pfcp_object_t;
 
@@ -148,12 +148,13 @@ typedef struct ogs_pfcp_bar_s ogs_pfcp_bar_t;
 typedef struct ogs_pfcp_pdr_s {
     ogs_pfcp_object_t       obj;
 
-    ogs_pool_id_t           *teid_node;  /* A node of TEID */
-    ogs_pool_id_t           teid;
+    ogs_pool_id_t           *teid_node;  /* A node of TEID */ /* int */
+    ogs_pool_id_t           teid; /* int */
 
-    ogs_lnode_t             to_create_node;
-    ogs_lnode_t             to_modify_node;
+    ogs_lnode_t             to_create_node; /* A node of list_t */
+    ogs_lnode_t             to_modify_node; /* A node of list_t */
 
+    /* TEID */
     struct {
         struct {
             int len;

@@ -30,6 +30,19 @@ static char* ip_to_str(uint32_t ip) {
     return str;
 }
 
+static char* interface_name(ogs_pfcp_interface_t interface) {
+    switch (interface) {
+        case OGS_PFCP_INTERFACE_ACCESS:
+            return "Access";
+        case OGS_PFCP_INTERFACE_CORE:
+            return "Core";
+        case OGS_PFCP_INTERFACE_CP_FUNCTION:
+            return "CP-Function";
+        default:
+            return "Unknown";
+    }
+}
+
 static void upf_n4_handle_create_urr(upf_sess_t *sess, ogs_pfcp_tlv_create_urr_t *create_urr_arr,
                               uint8_t *cause_value, uint8_t *offending_ie_value)
 {
@@ -217,13 +230,30 @@ void upf_n4_handle_session_establishment_request(
                  pdr->id, pdr->teid, teid_ipv4_addr,
                  pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
                  sess->apn_dnn ? sess->apn_dnn : ""); 
-
-        ogs_info("połączono");
-
+        /*
+        ogs_info("PDR[%d] TEID[%d] SRC-IP[%s] SRC-IF[%s] DEST-IP[%s] DEST-IF[%s]",
+                 pdr->id, pdr->teid, 
+                 pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
+                 
+                );
+        */
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)
             ogs_pfcp_object_teid_hash_set(
                     OGS_PFCP_OBJ_SESS_TYPE, pdr, restoration_indication);
+    }
+
+    for (i = 0; i < num_of_created_pdr; i++) {
+        ogs_info("PDR[%d] Precendence[%d] SRC-IF[%s] FAR-ID[%d] UE-IP[%s] Outer-Header-Removal[%d]",
+            &req->create_pdr[i].pdr_id,
+            &req->create_pdr[i].precedence,
+            interface_name(&req->create_pdr[i].pdi.source_interface),
+            &req->create_pdr[i].far_id,
+            &req->create_pdr[i].pdi.ue_ip_address.presence ? 
+                ip_to_str(req->create_pdr[i].pdi.ue_ip_address.data) : "N/A",
+            &req->create_pdr[i].outer_header_removal.presence ? 
+                req->create_pdr[i].outer_header_removal.data : 0
+        );
     }
 
     /* Send Buffered Packet to gNB/SGW */

@@ -232,8 +232,8 @@ void upf_n4_handle_session_establishment_request(
             pdr->far ? pdr->far->id : 0,
             pdr->ue_ip_addr_len ?
                 ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
-            &req->create_pdr[i].outer_header_removal.len ? 
-                (char *)&req->create_pdr[i].outer_header_removal.data : "N/A"
+            &req->create_pdr[i].outer_header_removal.presence ? 
+                "Yes" : "N/A"
         );
 
         /* Print data 

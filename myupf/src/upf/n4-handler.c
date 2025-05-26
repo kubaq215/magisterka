@@ -222,13 +222,24 @@ void upf_n4_handle_session_establishment_request(
                 goto cleanup;
         }
 
-        char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);
+        /*char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);*/
 
-        /* Print data */
+        ogs_info("------------------ PDR[%d] -----------------",
+            pdr->id);
+        ogs_info("Precendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%d]",
+            pdr->precedence,
+            interface_name(pdr->src_if),
+            pdr->far ? pdr->far->id : 0,
+            pdr->ue_ip_addr_len ?
+                ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
+            pdr->outer_header_removal.gtpu_extheader_deletion
+        );
+
+        /* Print data 
         ogs_info("PDR[%d] TEID[%d] TEID-IP[%s] UE-IP[%s] DNN[%s] ",
                  pdr->id, pdr->teid, teid_ipv4_addr,
                  pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
-                 sess->apn_dnn ? sess->apn_dnn : ""); 
+                 sess->apn_dnn ? sess->apn_dnn : ""); */
         /*
         ogs_info("PDR[%d] TEID[%d] SRC-IP[%s] SRC-IF[%s] DEST-IP[%s] DEST-IF[%s]",
                  pdr->id, pdr->teid, 
@@ -253,19 +264,20 @@ void upf_n4_handle_session_establishment_request(
             &req->create_pdr[i].outer_header_removal.presence ? 
                 *(int *)req->create_pdr[i].outer_header_removal.data : 0
         );
-    }*/
+    }*//*
     for (i = 0; i < num_of_created_pdr; i++) {
-        ogs_info("PDR[%d] Precendence[%d] SRC-IF[%s] FAR-ID[%d] UE-IP[%s] Outer-Header-Removal[%d]",
-            created_pdr[i]->id,
+        ogs_info("------------------ PDR[%d] -----------------",
+            created_pdr[i]->id);
+        ogs_info("Precendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%d]",
             created_pdr[i]->precedence,
             interface_name(created_pdr[i]->src_if),
             created_pdr[i]->far ? created_pdr[i]->far->id : 0,
             created_pdr[i]->ue_ip_addr_len ?
                 ip_to_str(created_pdr[i]->ue_ip_addr.addr) : "N/A",
-            created_pdr[i]->outer_header_removal.description
+            created_pdr[i]->outer_header_removal.gtpu_extheader_deletion
         );
-    }
-    
+    }*/
+
     /* Send Buffered Packet to gNB/SGW */
     ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
         if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) { /* Downlink */

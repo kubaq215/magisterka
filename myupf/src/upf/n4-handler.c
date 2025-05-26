@@ -30,16 +30,15 @@ static char* ip_to_str(uint32_t ip) {
     return str;
 }
 
-static char* interface_name(ogs_pfcp_interface_t interface) {
-    switch (interface) {
-        case OGS_PFCP_INTERFACE_ACCESS:
-            return "Access";
-        case OGS_PFCP_INTERFACE_CORE:
-            return "Core";
-        case OGS_PFCP_INTERFACE_CP_FUNCTION:
-            return "CP-Function";
-        default:
-            return "Unknown";
+static const char* interface_name(ogs_pfcp_interface_t interface) {
+    if (interface == OGS_PFCP_INTERFACE_ACCESS) {
+        return "Access";
+    } else if (interface == OGS_PFCP_INTERFACE_CORE) {
+        return "Core";
+    } else if (interface == OGS_PFCP_INTERFACE_CP_FUNCTION) {
+        return "CP Function";
+    } else {
+        return "Unknown";
     }
 }
 
@@ -243,19 +242,30 @@ void upf_n4_handle_session_establishment_request(
                     OGS_PFCP_OBJ_SESS_TYPE, pdr, restoration_indication);
     }
 
-    for (i = 0; i < num_of_created_pdr; i++) {
+    /*for (i = 0; i < num_of_created_pdr; i++) {
         ogs_info("PDR[%d] Precendence[%d] SRC-IF[%s] FAR-ID[%d] UE-IP[%s] Outer-Header-Removal[%d]",
             &req->create_pdr[i].pdr_id,
             &req->create_pdr[i].precedence,
             interface_name(&req->create_pdr[i].pdi.source_interface),
             &req->create_pdr[i].far_id,
             &req->create_pdr[i].pdi.ue_ip_address.presence ? 
-                ip_to_str(req->create_pdr[i].pdi.ue_ip_address.data) : "N/A",
+                ip_to_str(*(int *)req->create_pdr[i].pdi.ue_ip_address.data) : "N/A",
             &req->create_pdr[i].outer_header_removal.presence ? 
-                req->create_pdr[i].outer_header_removal.data : 0
+                *(int *)req->create_pdr[i].outer_header_removal.data : 0
+        );
+    }*/
+    for (i = 0; i < num_of_created_pdr; i++) {
+        ogs_info("PDR[%d] Precendence[%d] SRC-IF[%s] FAR-ID[%d] UE-IP[%s] Outer-Header-Removal[%d]",
+            created_pdr[i]->id,
+            created_pdr[i]->precedence,
+            interface_name(created_pdr[i]->src_if),
+            created_pdr[i]->far ? created_pdr[i]->far->id : 0,
+            created_pdr[i]->ue_ip_addr_len ?
+                ip_to_str(created_pdr[i]->ue_ip_addr.addr) : "N/A",
+            created_pdr[i]->outer_header_removal.description
         );
     }
-
+    
     /* Send Buffered Packet to gNB/SGW */
     ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
         if (pdr->src_if == OGS_PFCP_INTERFACE_CORE) { /* Downlink */

@@ -263,7 +263,8 @@ void upf_n4_handle_session_establishment_request(
             pdr->outer_header_removal_len ? "Yes" : "N/A",
             pdr->far ? pdr->far->id : 0,
             determine_apply_action_type(myfar->apply_action),
-            myfar->dst_if_type_presence ? interface_name(myfar->dst_if_type) : "N/A",
+            myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
+            myfar->outer_header_creation ? "Yes" : "N/A",
             myfar->outer_header_creation_len ? "Yes" : "N/A",
             myfar->outer_header_creation_len ? ip_to_str(myfar->outer_header_creation.ip4) : "N/A",
             myfar->outer_header_creation_len ? myfar->outer_header_creation.teid : 0

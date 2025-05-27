@@ -251,11 +251,9 @@ void upf_n4_handle_session_establishment_request(
                 goto cleanup;
         }
 
-        /*char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);*/
-
         ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
 
-        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ Tunnel-IP[%s] \n| | TEID[%d]",
+        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ TEID-IP[%s] \n| | TEID[%d]\n",
             pdr->id,
             pdr->precedence,
             interface_name(pdr->src_if),    
@@ -264,53 +262,16 @@ void upf_n4_handle_session_establishment_request(
             pdr->far ? pdr->far->id : 0,
             determine_apply_action_type(myfar->apply_action),
             myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
-            myfar->outer_header_creation_len ? "Yes" : "N/A",
+            myfar->outer_header_creation.teid ? "Yes" : "No",
             myfar->outer_header_creation.addr ? ip_to_str(myfar->outer_header_creation.addr) : "N/A",
             myfar->outer_header_creation.teid ? myfar->outer_header_creation.teid : 0
         );
 
-        /* Print data 
-        ogs_info("PDR[%d] TEID[%d] TEID-IP[%s] UE-IP[%s] DNN[%s] ",
-                 pdr->id, pdr->teid, teid_ipv4_addr,
-                 pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
-                 sess->apn_dnn ? sess->apn_dnn : ""); */
-        /*
-        ogs_info("PDR[%d] TEID[%d] SRC-IP[%s] SRC-IF[%s] DEST-IP[%s] DEST-IF[%s]",
-                 pdr->id, pdr->teid, 
-                 pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "",
-                 
-                );
-        */
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)
             ogs_pfcp_object_teid_hash_set(
                     OGS_PFCP_OBJ_SESS_TYPE, pdr, restoration_indication);
     }
-
-    /*for (i = 0; i < num_of_created_pdr; i++) {
-        ogs_info("PDR[%d] Precendence[%d] SRC-IF[%s] FAR-ID[%d] UE-IP[%s] Outer-Header-Removal[%d]",
-            &req->create_pdr[i].pdr_id,
-            &req->create_pdr[i].precedence,
-            interface_name(&req->create_pdr[i].pdi.source_interface),
-            &req->create_pdr[i].far_id,
-            &req->create_pdr[i].pdi.ue_ip_address.presence ? 
-                ip_to_str(*(int *)req->create_pdr[i].pdi.ue_ip_address.data) : "N/A",
-            &req->create_pdr[i].outer_header_removal.presence ? 
-                *(int *)req->create_pdr[i].outer_header_removal.data : 0
-        );
-    }*//*
-    for (i = 0; i < num_of_created_pdr; i++) {
-        ogs_info("------------------ PDR[%d] -----------------",
-            created_pdr[i]->id);
-        ogs_info("Precendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%d]",
-            created_pdr[i]->precedence,
-            interface_name(created_pdr[i]->src_if),
-            created_pdr[i]->far ? created_pdr[i]->far->id : 0,
-            created_pdr[i]->ue_ip_addr_len ?
-                ip_to_str(created_pdr[i]->ue_ip_addr.addr) : "N/A",
-            created_pdr[i]->outer_header_removal.gtpu_extheader_deletion
-        );
-    }*/
 
     /* Send Buffered Packet to gNB/SGW */
     ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {

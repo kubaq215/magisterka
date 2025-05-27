@@ -255,7 +255,7 @@ void upf_n4_handle_session_establishment_request(
 
         ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
 
-        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| \\ Outer-Header-Creation[%s] \n| | Tunnel-IP[%s] \n| | TEID[%d]",
+        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ Tunnel-IP[%s] \n| | TEID[%d]",
             pdr->id,
             pdr->precedence,
             interface_name(pdr->src_if),    
@@ -264,9 +264,9 @@ void upf_n4_handle_session_establishment_request(
             pdr->far ? pdr->far->id : 0,
             determine_apply_action_type(myfar->apply_action),
             myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
-            myfar->outer_header_creation.ip4 ? "Yes" : "N/A",
-            myfar->outer_header_creation_len ? ip_to_str(myfar->outer_header_creation.ip4) : "N/A",
-            myfar->outer_header_creation_len ? myfar->outer_header_creation.teid : 0
+            myfar->outer_header_creation_len ? "Yes" : "N/A",
+            myfar->outer_header_creation.addr ? ip_to_str(myfar->outer_header_creation.addr) : "N/A",
+            myfar->outer_header_creation.teid ? myfar->outer_header_creation.teid : 0
         );
 
         /* Print data 

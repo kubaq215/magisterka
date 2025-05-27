@@ -31,18 +31,26 @@ static char* ip_to_str(uint32_t ip) {
 }
 
 static const char* interface_name(ogs_pfcp_interface_t interface) {
-    if (interface == OGS_PFCP_INTERFACE_ACCESS) {
-        return "Access";
-    } else if (interface == OGS_PFCP_INTERFACE_CORE) {
-        return "Core";
-    } else if (interface == OGS_PFCP_INTERFACE_CP_FUNCTION) {
-        return "CP Function";
-    } else {
-        return "Unknown";
+    switch (interface) {
+        case OGS_PFCP_INTERFACE_ACCESS:
+            return "Access";
+        case OGS_PFCP_INTERFACE_CORE:
+            return "Core";
+        case OGS_PFCP_INTERFACE_SGI_N6_LAN:
+            return "SGi-N6-LAN";
+        case OGS_PFCP_INTERFACE_CP_FUNCTION:
+            return "CP-Function";
+        case OGS_PFCP_INTERFACE_LI_FUNCTION:
+            return "LI-Function";
+        case OGS_PFCP_INTERFACE_UNKNOWN:
+            return "Unknown";
+        default:
+            return "Invalid";
     }
 }
 
-static const char *determine_apply_action_type(ogs_pfcp_apply_action_t action) {
+
+static const char* determine_apply_action_type(ogs_pfcp_apply_action_t action) {
     static char result[256];
     result[0] = '\0'; // Clear the buffer
 

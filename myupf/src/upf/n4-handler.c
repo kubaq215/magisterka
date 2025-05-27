@@ -384,6 +384,7 @@ void upf_n4_handle_session_modification_request(
         far->smreq_flags.value = 0;
 
     for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        ogs_info("dupa");
         if (ogs_pfcp_handle_update_far(&sess->pfcp, &req->update_far[i],
                     &cause_value, &offending_ie_value) == NULL)
             break;
@@ -472,6 +473,11 @@ void upf_n4_handle_session_modification_request(
         pdr = created_pdr[i];
         ogs_assert(pdr);
 
+        /* Setup UPF-N3-TEID & QFI Hash */
+        if (pdr->f_teid_len)
+            ogs_pfcp_object_teid_hash_set(OGS_PFCP_OBJ_SESS_TYPE, pdr, false);
+
+        
         ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
 
         ogs_info("\n----- Session[%d] - Update PDR[%d] ------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ TEID-IP[%s] \n| | TEID[%d]\n",
@@ -488,10 +494,6 @@ void upf_n4_handle_session_modification_request(
             myfar->outer_header_creation.addr ? ip_to_str(myfar->outer_header_creation.addr) : "N/A",
             myfar->outer_header_creation.teid ? myfar->outer_header_creation.teid : 0
         );
-
-        /* Setup UPF-N3-TEID & QFI Hash */
-        if (pdr->f_teid_len)
-            ogs_pfcp_object_teid_hash_set(OGS_PFCP_OBJ_SESS_TYPE, pdr, false);
     }
 
     /* Send Buffered Packet to gNB/SGW */

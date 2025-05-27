@@ -334,31 +334,70 @@ void upf_n4_handle_session_modification_request(
                 &req->create_pdr[i], NULL, &cause_value, &offending_ie_value);
         if (created_pdr[i] == NULL)
             break;
+        
+        pdr = created_pdr[i];    
+            
+        ogs_info("\n----- Session[%d] - Update PDR[%d] (Create) ---- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n",
+            sess->id,
+            pdr->id,
+            pdr->precedence,
+            interface_name(pdr->src_if),    
+            pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
+            pdr->outer_header_removal_len ? "Yes" : "No",
+            pdr->far ? pdr->far->id : 0
+        );
     }
     num_of_created_pdr = i;
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
 
     for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
-        if (ogs_pfcp_handle_update_pdr(&sess->pfcp, &req->update_pdr[i],
-                    &cause_value, &offending_ie_value) == NULL)
+        pdr = ogs_pfcp_handle_update_pdr(&sess->pfcp, &req->update_pdr[i],
+                    &cause_value, &offending_ie_value);
+        if (pdr == NULL)
             break;
+
+        ogs_info("\n----- Session[%d] - Update PDR[%d] ------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n",
+            sess->id,
+            pdr->id,
+            pdr->precedence,
+            interface_name(pdr->src_if),    
+            pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
+            pdr->outer_header_removal_len ? "Yes" : "No",
+            pdr->far ? pdr->far->id : 0
+        );
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
 
     for (i = 0; i < OGS_MAX_NUM_OF_PDR; i++) {
+        int pdr_id = req->remove_pdr[i].pdr_id.u16;
         if (ogs_pfcp_handle_remove_pdr(&sess->pfcp, &req->remove_pdr[i],
                 &cause_value, &offending_ie_value) == false)
             break;
+
+        ogs_info("\n----- Session[%d] - Create PDR[%d] (Remove) ---- \n",
+            sess->id,
+            pdr_id
+        );
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
 
     for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
-        if (ogs_pfcp_handle_create_far(&sess->pfcp, &req->create_far[i],
-                    &cause_value, &offending_ie_value) == NULL)
+        far = ogs_pfcp_handle_create_far(&sess->pfcp, &req->create_far[i],
+                    &cause_value, &offending_ie_value);
+        if (far == NULL)
             break;
+        ogs_info("\n----- Session[%d] - Update FAR[%d] (Create) ---- \nApply-Action[%s] \nDST-IF[%s] \nOuter-Header-Creation[%s] \n\\ TEID-IP[%s] \n| TEID[%d]\n",
+            sess->id,
+            far->id,
+            determine_apply_action_type(far->apply_action),
+            far->dst_if ? interface_name(far->dst_if) : "N/A",
+            far->outer_header_creation.teid ? "Yes" : "No",
+            far->outer_header_creation.addr ? ip_to_str(far->outer_header_creation.addr) : "N/A",
+            far->outer_header_creation.teid ? far->outer_header_creation.teid : 0
+        );
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
@@ -384,18 +423,33 @@ void upf_n4_handle_session_modification_request(
         far->smreq_flags.value = 0;
 
     for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
-        ogs_info("dupa");
-        if (ogs_pfcp_handle_update_far(&sess->pfcp, &req->update_far[i],
-                    &cause_value, &offending_ie_value) == NULL)
+        far = ogs_pfcp_handle_update_far(&sess->pfcp, &req->update_far[i],
+                    &cause_value, &offending_ie_value);
+        if (far == NULL)
             break;
+
+        ogs_info("\n----- Session[%d] - Update FAR[%d] ------- \nApply-Action[%s] \nDST-IF[%s] \nOuter-Header-Creation[%s] \n\\ TEID-IP[%s] \n| TEID[%d]\n",
+            sess->id,
+            far->id,
+            determine_apply_action_type(far->apply_action),
+            far->dst_if ? interface_name(far->dst_if) : "N/A",
+            far->outer_header_creation.teid ? "Yes" : "No",
+            far->outer_header_creation.addr ? ip_to_str(far->outer_header_creation.addr) : "N/A",
+            far->outer_header_creation.teid ? far->outer_header_creation.teid : 0
+        );
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
 
     for (i = 0; i < OGS_MAX_NUM_OF_FAR; i++) {
+        int far_id = req->remove_far[i].far_id.u32;
         if (ogs_pfcp_handle_remove_far(&sess->pfcp, &req->remove_far[i],
                 &cause_value, &offending_ie_value) == false)
             break;
+        ogs_info("\n----- Session[%d] - Update FAR[%d] (Remove) ----\n",
+            sess->id,
+            far_id
+        );
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
@@ -476,24 +530,6 @@ void upf_n4_handle_session_modification_request(
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)
             ogs_pfcp_object_teid_hash_set(OGS_PFCP_OBJ_SESS_TYPE, pdr, false);
-
-        
-        ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
-
-        ogs_info("\n----- Session[%d] - Update PDR[%d] ------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ TEID-IP[%s] \n| | TEID[%d]\n",
-            sess->id,
-            pdr->id,
-            pdr->precedence,
-            interface_name(pdr->src_if),    
-            pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
-            pdr->outer_header_removal_len ? "Yes" : "No",
-            pdr->far ? pdr->far->id : 0,
-            determine_apply_action_type(myfar->apply_action),
-            myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
-            myfar->outer_header_creation.teid ? "Yes" : "No",
-            myfar->outer_header_creation.addr ? ip_to_str(myfar->outer_header_creation.addr) : "N/A",
-            myfar->outer_header_creation.teid ? myfar->outer_header_creation.teid : 0
-        );
     }
 
     /* Send Buffered Packet to gNB/SGW */

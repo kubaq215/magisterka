@@ -42,6 +42,35 @@ static const char* interface_name(ogs_pfcp_interface_t interface) {
     }
 }
 
+static const char *determine_apply_action_type(ogs_pfcp_apply_action_t action) {
+    static char result[256];
+    result[0] = '\0'; // Clear the buffer
+
+    #define APPEND_ACTION(name, flag) \
+        if (action & flag) { \
+            if (result[0] != '\0') strcat(result, ", "); \
+            strcat(result, name); \
+        }
+
+    APPEND_ACTION("DROP", OGS_PFCP_APPLY_ACTION_DROP);
+    APPEND_ACTION("FORW", OGS_PFCP_APPLY_ACTION_FORW);
+    APPEND_ACTION("BUFF", OGS_PFCP_APPLY_ACTION_BUFF);
+    APPEND_ACTION("NOCP", OGS_PFCP_APPLY_ACTION_NOCP);
+    APPEND_ACTION("DUPL", OGS_PFCP_APPLY_ACTION_DUPL);
+    APPEND_ACTION("IPMA", OGS_PFCP_APPLY_ACTION_IPMA);
+    APPEND_ACTION("IPMD", OGS_PFCP_APPLY_ACTION_IPMD);
+    APPEND_ACTION("DFRT", OGS_PFCP_APPLY_ACTION_DFRT);
+    APPEND_ACTION("EDRT", OGS_PFCP_APPLY_ACTION_EDRT);
+    APPEND_ACTION("BDPN", OGS_PFCP_APPLY_ACTION_BDPN);
+    APPEND_ACTION("DDPN", OGS_PFCP_APPLY_ACTION_DDPN);
+    APPEND_ACTION("FSSM", OGS_PFCP_APPLY_ACTION_FSSM);
+    APPEND_ACTION("MBSU", OGS_PFCP_APPLY_ACTION_MBSU);
+
+    #undef APPEND_ACTION
+
+    return result;
+}
+
 static void upf_n4_handle_create_urr(upf_sess_t *sess, ogs_pfcp_tlv_create_urr_t *create_urr_arr,
                               uint8_t *cause_value, uint8_t *offending_ie_value)
 {
@@ -224,16 +253,20 @@ void upf_n4_handle_session_establishment_request(
 
         /*char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);*/
 
-        ogs_info(
-            "\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%s]",
+        ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
+
+        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \nApply-Action[%s] \nDST-IF[%s] \nOuter-Header-Creation[%s] \nTunnel-IP[%s] \nTEID[%d]",
             pdr->id,
             pdr->precedence,
-            interface_name(pdr->src_if),
+            interface_name(pdr->src_if),    
+            pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
+            pdr->outer_header_removal_len ? "Yes" : "N/A",
             pdr->far ? pdr->far->id : 0,
-            pdr->ue_ip_addr_len ?
-                ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
-            pdr->outer_header_removal_len ? 
-                "Yes" : "N/A"
+            determine_apply_action_type(myfar->apply_action),
+            myfar->dst_if_type_presence ? interface_name(myfar->dst_if_type) : "N/A",
+            myfar->outer_header_creation_len ? "Yes" : "N/A",
+            myfar->outer_header_creation_len ? ip_to_str(myfar->outer_header_creation.ip4) : "N/A",
+            myfar->outer_header_creation_len ? myfar->outer_header_creation.teid : 0
         );
 
         /* Print data 

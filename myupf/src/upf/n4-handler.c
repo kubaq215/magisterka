@@ -440,7 +440,7 @@ void upf_n4_handle_session_modification_request(
             sess->id,
             far->id,
             determine_apply_action_type(far->apply_action),
-            far->dst_if ? interface_name(far->dst_if) : "N/A",
+            interface_name(far->dst_if),
             far->outer_header_creation.teid ? "Yes" : "No",
             far->outer_header_creation.addr ? ip_to_str(far->outer_header_creation.addr) : "N/A",
             far->outer_header_creation.teid ? far->outer_header_creation.teid : 0

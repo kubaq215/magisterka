@@ -255,7 +255,7 @@ void upf_n4_handle_session_establishment_request(
 
         ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
 
-        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| Tunnel-IP[%s] \n| TEID[%d]",
+        ogs_info("\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| \\ Outer-Header-Creation[%s] \n| | Tunnel-IP[%s] \n| | TEID[%d]",
             pdr->id,
             pdr->precedence,
             interface_name(pdr->src_if),    

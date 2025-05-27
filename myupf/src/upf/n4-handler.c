@@ -259,7 +259,7 @@ void upf_n4_handle_session_establishment_request(
             pdr->precedence,
             interface_name(pdr->src_if),    
             pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
-            pdr->outer_header_removal_len ? "Yes" : "N/A",
+            pdr->outer_header_removal_len ? "Yes" : "No",
             pdr->far ? pdr->far->id : 0,
             determine_apply_action_type(myfar->apply_action),
             myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
@@ -471,6 +471,23 @@ void upf_n4_handle_session_modification_request(
     for (i = 0; i < num_of_created_pdr; i++) {
         pdr = created_pdr[i];
         ogs_assert(pdr);
+
+        ogs_pfcp_far_t *myfar = ogs_pfcp_far_find(&sess->pfcp, pdr->far->id);
+
+        ogs_info("\n----- Session[%d] - Update PDR[%d] ------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n\\ Apply-Action[%s] \n| DST-IF[%s] \n| Outer-Header-Creation[%s] \n| \\ TEID-IP[%s] \n| | TEID[%d]\n",
+            sess->id,
+            pdr->id,
+            pdr->precedence,
+            interface_name(pdr->src_if),    
+            pdr->ue_ip_addr_len ? ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
+            pdr->outer_header_removal_len ? "Yes" : "No",
+            pdr->far ? pdr->far->id : 0,
+            determine_apply_action_type(myfar->apply_action),
+            myfar->dst_if ? interface_name(myfar->dst_if) : "N/A",
+            myfar->outer_header_creation.teid ? "Yes" : "No",
+            myfar->outer_header_creation.addr ? ip_to_str(myfar->outer_header_creation.addr) : "N/A",
+            myfar->outer_header_creation.teid ? myfar->outer_header_creation.teid : 0
+        );
 
         /* Setup UPF-N3-TEID & QFI Hash */
         if (pdr->f_teid_len)

@@ -225,14 +225,14 @@ void upf_n4_handle_session_establishment_request(
         /*char *teid_ipv4_addr = ip_to_str(pdr->f_teid.addr);*/
 
         ogs_info(
-            "------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%s]",
+            "\n------------------ PDR[%d] ----------------- \nPrecendence[%d] \nSRC-IF[%s] \nFAR-ID[%d] \nUE-IP[%s] \nOuter-Header-Removal[%s]",
             pdr->id,
             pdr->precedence,
             interface_name(pdr->src_if),
             pdr->far ? pdr->far->id : 0,
             pdr->ue_ip_addr_len ?
                 ip_to_str(pdr->ue_ip_addr.addr) : "N/A",
-            &req->create_pdr[i].outer_header_removal.presence ? 
+            pdr->outer_header_removal_len ? 
                 "Yes" : "N/A"
         );
 

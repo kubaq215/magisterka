@@ -575,8 +575,6 @@ void upf_n4_handle_session_deletion_request(
 
     ogs_debug("Session Deletion Request");
 
-    ogs_info("rozłączono");
-
     if (!sess) {
         ogs_error("No Context");
         ogs_pfcp_send_error_message(xact, 0,
@@ -590,6 +588,9 @@ void upf_n4_handle_session_deletion_request(
         upf_metrics_inst_by_dnn_add(sess->apn_dnn,
                 UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
     }
+
+    ogs_info("----- Session[%d] - Deleted ------", sess->id);
+
     upf_sess_remove(sess);
 }
 

@@ -114,7 +114,7 @@ int ogs_sock_bind(ogs_sock_t *sock, ogs_sockaddr_t *addr)
         ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno,
                 "socket bind(%d) [%s]:%d failed",
                 addr->ogs_sa_family, OGS_ADDR(addr, buf), OGS_PORT(addr));
-        return OGS_ERROR;
+        // return OGS_ERROR;
     }
 
     memcpy(&sock->local_addr, addr, sizeof(sock->local_addr));

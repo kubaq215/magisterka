@@ -34,7 +34,7 @@
 
 #include "timer.h"
 #include "upf-sm.h"
-#include "metrics.h"
+// #include "metrics.h"
 
 #ifdef __cplusplus
 extern "C" {

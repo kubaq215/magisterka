@@ -115,7 +115,7 @@ void upf_n4_handle_session_establishment_request(
     ogs_pfcp_sereq_flags_t sereq_flags;
     bool restoration_indication = false;
 
-    upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONESTABREQ);
+    // upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONESTABREQ);
 
     ogs_assert(xact);
     ogs_assert(req);
@@ -129,8 +129,8 @@ void upf_n4_handle_session_establishment_request(
         ogs_pfcp_send_error_message(xact, 0,
                 OGS_PFCP_SESSION_ESTABLISHMENT_RESPONSE_TYPE,
                 OGS_PFCP_CAUSE_MANDATORY_IE_MISSING, 0);
-        upf_metrics_inst_by_cause_add(OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
-                UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
+        // upf_metrics_inst_by_cause_add(OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
+        //         UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
         return;
     }
 
@@ -181,8 +181,8 @@ void upf_n4_handle_session_establishment_request(
         if (ogs_pfcp_handle_create_qer(&sess->pfcp, &req->create_qer[i],
                     &cause_value, &offending_ie_value) == NULL)
             break;
-        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
-                UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
+        // upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+        //         UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
@@ -302,8 +302,8 @@ void upf_n4_handle_session_establishment_request(
     return;
 
 cleanup:
-    upf_metrics_inst_by_cause_add(cause_value,
-            UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
+    // upf_metrics_inst_by_cause_add(cause_value,
+    //         UPF_METR_CTR_SM_N4SESSIONESTABFAIL, 1);
     ogs_pfcp_sess_clear(&sess->pfcp);
     ogs_pfcp_send_error_message(xact, sess ? sess->smf_n4_f_seid.seid : 0,
             OGS_PFCP_SESSION_ESTABLISHMENT_RESPONSE_TYPE,
@@ -486,8 +486,8 @@ void upf_n4_handle_session_modification_request(
         if (ogs_pfcp_handle_create_qer(&sess->pfcp, &req->create_qer[i],
                     &cause_value, &offending_ie_value) == NULL)
             break;
-        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
-                UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
+        // upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+        //         UPF_METR_GAUGE_UPF_QOSFLOWS, 1);
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
@@ -504,8 +504,8 @@ void upf_n4_handle_session_modification_request(
         if (ogs_pfcp_handle_remove_qer(&sess->pfcp, &req->remove_qer[i],
                 &cause_value, &offending_ie_value) == false)
             break;
-        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
-                UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
+        // upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+        //         UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
     }
     if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
         goto cleanup;
@@ -584,10 +584,10 @@ void upf_n4_handle_session_deletion_request(
     }
     upf_pfcp_send_session_deletion_response(xact, sess);
 
-    ogs_list_for_each(&sess->pfcp.qer_list, qer) {
-        upf_metrics_inst_by_dnn_add(sess->apn_dnn,
-                UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
-    }
+    // ogs_list_for_each(&sess->pfcp.qer_list, qer) {
+    //     upf_metrics_inst_by_dnn_add(sess->apn_dnn,
+    //             UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
+    // }
 
     ogs_info("----- Session[%d] - Deleted ------", sess->id);
 
@@ -628,7 +628,7 @@ void upf_n4_handle_session_report_response(
         ogs_error("Cause request not accepted[%d]", cause_value);
         return;
     } else {
-        upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONREPORTSUCC);
+        // upf_metrics_inst_global_inc(UPF_METR_GLOB_CTR_SM_N4SESSIONREPORTSUCC);
     }
 
 }

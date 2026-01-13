@@ -204,7 +204,7 @@ upf_sess_t *upf_sess_add(ogs_pfcp_f_seid_t *cp_f_seid)
             sizeof(sess->smf_n4_f_seid.seid), sess);
 
     ogs_list_add(&self.sess_list, sess);
-    upf_metrics_inst_global_inc(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
+    // upf_metrics_inst_global_inc(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
 
     ogs_info("[Added] Number of UPF-Sessions is now %d",
             ogs_list_count(&self.sess_list));
@@ -248,7 +248,7 @@ int upf_sess_remove(upf_sess_t *sess)
     ogs_pool_id_free(&upf_sess_pool, sess);
     if (sess->apn_dnn)
         ogs_free(sess->apn_dnn);
-    upf_metrics_inst_global_dec(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
+    // upf_metrics_inst_global_dec(UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR);
 
     ogs_info("[Removed] Number of UPF-sessions is now %d",
             ogs_list_count(&self.sess_list));

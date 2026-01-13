@@ -38,30 +38,30 @@ ogs_sock_t *ogs_udp_server(
         memcpy(&option, socket_option, sizeof option);
 
     addr = sa_list;
-    // while (addr) {
-    //     new = ogs_sock_socket(addr->ogs_sa_family, SOCK_DGRAM, IPPROTO_UDP);
-    //     if (!new) {
-    //         addr = addr->next;
-    //         continue;
-    //     }
-    //     if (ogs_sock_bind(new, addr) != OGS_OK) {
-    //         ogs_sock_destroy(new);
-    //         addr = addr->next;
-    //         continue;
-    //     }
-    //     ogs_debug("udp_server() [%s]:%d", OGS_ADDR(addr, buf), OGS_PORT(addr));
-    //     if (option.so_bindtodevice) {
-    //         if (ogs_bind_to_device(new->fd, option.so_bindtodevice) != OGS_OK) {
-    //             ogs_sock_destroy(new);
-    //             addr = addr->next;
-    //             continue;
-    //         }
-    //         ogs_info("udp_server() [%s]:%d bound to device `%s`",
-    //                 OGS_ADDR(addr, buf), OGS_PORT(addr),
-    //                 option.so_bindtodevice);
-    //     }
-    //     break;
-    // }
+    while (addr) {
+        new = ogs_sock_socket(addr->ogs_sa_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (!new) {
+            addr = addr->next;
+            continue;
+        }
+        if (ogs_sock_bind(new, addr) != OGS_OK) {
+            ogs_sock_destroy(new);
+            addr = addr->next;
+            continue;
+        }
+        ogs_debug("udp_server() [%s]:%d", OGS_ADDR(addr, buf), OGS_PORT(addr));
+        if (option.so_bindtodevice) {
+            if (ogs_bind_to_device(new->fd, option.so_bindtodevice) != OGS_OK) {
+                ogs_sock_destroy(new);
+                addr = addr->next;
+                continue;
+            }
+            ogs_info("udp_server() [%s]:%d bound to device `%s`",
+                    OGS_ADDR(addr, buf), OGS_PORT(addr),
+                    option.so_bindtodevice);
+        }
+        break;
+    }
 
     if (addr == NULL) {
         ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno,

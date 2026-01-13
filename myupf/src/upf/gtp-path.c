@@ -768,27 +768,52 @@ static void _get_dev_mac_addr(char *ifname, uint8_t *mac_addr)
 
 int upf_gtp_open(void)
 {
-    // ogs_pfcp_dev_t *dev = NULL;
-    // ogs_pfcp_subnet_t *subnet = NULL;
-    // ogs_socknode_t *node = NULL;
-    // ogs_sock_t *sock = NULL;
-    // int rc;
+    ogs_pfcp_dev_t *dev = NULL;
+    ogs_pfcp_subnet_t *subnet = NULL;
+    ogs_socknode_t *node = NULL;
+    ogs_sock_t *sock = NULL;
+    int rc;
 
-    // ogs_list_for_each(&ogs_gtp_self()->gtpu_list, node) {
-    //     sock = ogs_gtp_server(node);
-    //     if (!sock) return OGS_ERROR;
+    ogs_list_for_each(&ogs_gtp_self()->gtpu_list, node) {
+        // sock = ogs_gtp_server(node);
+        // if (!sock) return OGS_ERROR;
+        
+        sock = ogs_sock_socket(node->family, node->type, IPPROTO_UDP);
+        if (!sock) {
+            ogs_error("Cannot create socket (family:%d, type:%d)",
+                    node->family, node->type);
+            return OGS_ERROR;
+        }
 
-    //     if (sock->family == AF_INET)
-    //         ogs_gtp_self()->gtpu_sock = sock;
-    //     else if (sock->family == AF_INET6)
-    //         ogs_gtp_self()->gtpu_sock6 = sock;
+        ogs_sockaddr_t loopback;
+        memset(&loopback, 0, sizeof(loopback));
+        loopback.ogs_sa_family = node->family;
+        if (node->family == AF_INET) {
+            loopback.sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            loopback.sin.sin_port = htons(0);
+        } else if (node->family == AF_INET6) {
+            loopback.sin6.sin6_addr = in6addr_loopback;
+            loopback.sin6.sin6_port = htons(0);
+        }
 
-    //     node->poll = ogs_pollset_add(ogs_app()->pollset,
-    //             OGS_POLLIN, sock->fd, _gtpv1_u_recv_cb, sock);
-    //     ogs_assert(node->poll);
-    // }
+        rc = ogs_sock_bind(sock, &loopback);
+        if (rc != OGS_OK) {
+            ogs_error("Cannot bind socket to loopback");
+            ogs_sock_destroy(sock);
+            return OGS_ERROR;
+        }
 
-    // OGS_SETUP_GTPU_SERVER;
+        if (sock->family == AF_INET)
+            ogs_gtp_self()->gtpu_sock = sock;
+        else if (sock->family == AF_INET6)
+            ogs_gtp_self()->gtpu_sock6 = sock;
+
+        node->poll = ogs_pollset_add(ogs_app()->pollset,
+                OGS_POLLIN, sock->fd, _gtpv1_u_recv_cb, sock);
+        ogs_assert(node->poll);
+    }
+
+    OGS_SETUP_GTPU_SERVER;
 
     /* NOTE : tun device can be created via following command.
      *

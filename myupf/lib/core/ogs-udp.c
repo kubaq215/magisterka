@@ -44,11 +44,12 @@ ogs_sock_t *ogs_udp_server(
             addr = addr->next;
             continue;
         }
-        if (ogs_sock_bind(new, addr) != OGS_OK) {
-            ogs_sock_destroy(new);
-            addr = addr->next;
-            continue;
-        }
+        memcpy(&new->local_addr, addr, sizeof(new->local_addr));
+        // if (ogs_sock_bind(new, addr) != OGS_OK) {
+        //     ogs_sock_destroy(new);
+        //     addr = addr->next;
+        //     continue;
+        // }
         ogs_debug("udp_server() [%s]:%d", OGS_ADDR(addr, buf), OGS_PORT(addr));
         // if (option.so_bindtodevice) {
         //     if (ogs_bind_to_device(new->fd, option.so_bindtodevice) != OGS_OK) {

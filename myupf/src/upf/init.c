@@ -71,8 +71,8 @@ int upf_initialize(void)
     rv = upf_pfcp_open();
     if (rv != OGS_OK) return rv;
 
-    rv = upf_gtp_open();
-    if (rv != OGS_OK) return rv;
+    // rv = upf_gtp_open();
+    // if (rv != OGS_OK) return rv;
 
     thread = ogs_thread_create(upf_main, NULL);
     if (!thread) return OGS_ERROR;
@@ -91,18 +91,18 @@ void upf_terminate(void)
     ogs_thread_destroy(thread);
 
     upf_pfcp_close();
-    upf_gtp_close();
+    // upf_gtp_close();
 
     // ogs_metrics_context_close(ogs_metrics_self());
 
     upf_context_final();
 
     ogs_pfcp_context_final();
-    ogs_gtp_context_final();
+    // ogs_gtp_context_final();
 
     ogs_pfcp_xact_final();
 
-    upf_gtp_final();
+    // upf_gtp_final();
     upf_event_final();
 
     // upf_metrics_final();

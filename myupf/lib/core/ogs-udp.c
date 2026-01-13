@@ -53,16 +53,16 @@ ogs_sock_t *ogs_udp_server(
             continue;
         }
         ogs_debug("udp_server() [%s]:%d", OGS_ADDR(addr, buf), OGS_PORT(addr));
-        // if (option.so_bindtodevice) {
-        //     if (ogs_bind_to_device(new->fd, option.so_bindtodevice) != OGS_OK) {
-        //         ogs_sock_destroy(new);
-        //         addr = addr->next;
-        //         continue;
-        //     }
-        //     ogs_info("udp_server() [%s]:%d bound to device `%s`",
-        //             OGS_ADDR(addr, buf), OGS_PORT(addr),
-        //             option.so_bindtodevice);
-        // }
+        if (option.so_bindtodevice) {
+            if (ogs_bind_to_device(new->fd, option.so_bindtodevice) != OGS_OK) {
+                ogs_sock_destroy(new);
+                addr = addr->next;
+                continue;
+            }
+            ogs_info("udp_server() [%s]:%d bound to device `%s`",
+                    OGS_ADDR(addr, buf), OGS_PORT(addr),
+                    option.so_bindtodevice);
+        }
         break;
     }
 

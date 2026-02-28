@@ -4,3 +4,4 @@ myupf/subprojects/freeDiameter/
 myupf/subprojects/libtins/
 myupf/subprojects/prometheus-client-c/
 myupf/subprojects/usrsctp/
+pcaps/*

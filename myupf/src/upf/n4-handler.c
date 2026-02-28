@@ -21,6 +21,7 @@
 #include "pfcp-path.h"
 #include "gtp-path.h"
 #include "n4-handler.h"
+#include "upf-controller-notify.h"
 
 static char* ip_to_str(uint32_t ip) {
     static char str[INET_ADDRSTRLEN];
@@ -299,6 +300,10 @@ void upf_n4_handle_session_establishment_request(
             upf_pfcp_send_session_establishment_response(
                 xact, sess, created_pdr, num_of_created_pdr));
 
+    if (upf_controller_notify_session_establish(sess) != OGS_OK) {
+        ogs_warn("Failed to notify UPF controller about session establishment");
+    }
+
     return;
 
 cleanup:
@@ -317,7 +322,11 @@ void upf_n4_handle_session_modification_request(
     ogs_pfcp_pdr_t *pdr = NULL;
     ogs_pfcp_far_t *far = NULL;
     ogs_pfcp_pdr_t *created_pdr[OGS_MAX_NUM_OF_PDR];
+    ogs_pfcp_pdr_t *modified_pdr[OGS_MAX_NUM_OF_PDR * 2];
+    ogs_pfcp_far_t *modified_far[OGS_MAX_NUM_OF_FAR * 2];
     int num_of_created_pdr = 0;
+    int num_of_modified_pdr = 0;
+    int num_of_modified_far = 0;
     uint8_t cause_value = 0;
     uint8_t offending_ie_value = 0;
     int i;
@@ -342,6 +351,8 @@ void upf_n4_handle_session_modification_request(
                 &req->create_pdr[i], NULL, &cause_value, &offending_ie_value);
         if (created_pdr[i] == NULL)
             break;
+
+        modified_pdr[num_of_modified_pdr++] = created_pdr[i];
         
         pdr = created_pdr[i];    
             
@@ -364,6 +375,8 @@ void upf_n4_handle_session_modification_request(
                     &cause_value, &offending_ie_value);
         if (pdr == NULL)
             break;
+
+        modified_pdr[num_of_modified_pdr++] = pdr;
 
         ogs_info("\n----- Session[%d] - Update PDR[%d] ------- \nPrecendence[%d] \nSRC-IF[%s] \nUE-IP[%s] \nOuter-Header-Removal[%s] \nFAR-ID[%d] \n",
             sess->id,
@@ -397,6 +410,9 @@ void upf_n4_handle_session_modification_request(
                     &cause_value, &offending_ie_value);
         if (far == NULL)
             break;
+
+        modified_far[num_of_modified_far++] = far;
+
         ogs_info("\n----- Session[%d] - Update FAR[%d] (Create) ---- \nApply-Action[%s] \nDST-IF[%s] \nOuter-Header-Creation[%s] \n\\ TEID-IP[%s] \n| TEID[%d]\n",
             sess->id,
             far->id,
@@ -435,6 +451,8 @@ void upf_n4_handle_session_modification_request(
                     &cause_value, &offending_ie_value);
         if (far == NULL)
             break;
+
+        modified_far[num_of_modified_far++] = far;
 
         ogs_info("\n----- Session[%d] - Update FAR[%d] ------- \nApply-Action[%s] \nDST-IF[%s] \nOuter-Header-Creation[%s] \n\\ TEID-IP[%s] \n| TEID[%d]\n",
             sess->id,
@@ -555,6 +573,14 @@ void upf_n4_handle_session_modification_request(
         ogs_assert(OGS_OK ==
             upf_pfcp_send_session_modification_response(
                 xact, sess, created_pdr, num_of_created_pdr));
+
+    if (upf_controller_notify_session_modify(
+                sess,
+                modified_pdr, num_of_modified_pdr,
+                modified_far, num_of_modified_far) != OGS_OK) {
+        ogs_warn("Failed to notify UPF controller about session modification");
+    }
+
     return;
 
 cleanup:
@@ -590,6 +616,10 @@ void upf_n4_handle_session_deletion_request(
     // }
 
     ogs_info("----- Session[%d] - Deleted ------", sess->id);
+
+    if (upf_controller_notify_session_delete(sess) != OGS_OK) {
+        ogs_warn("Failed to notify UPF controller about session deletion");
+    }
 
     upf_sess_remove(sess);
 }

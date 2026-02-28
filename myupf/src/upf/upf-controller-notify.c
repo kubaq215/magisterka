@@ -356,14 +356,20 @@ int upf_controller_notify_session_establish(upf_sess_t *sess)
                     interface_name_api(far->dst_if)))
             return OGS_ERROR;
 
+        ogs_info("UPF controller FAR %u: teid=%u, outer_header_creation_len=%u",
+            far->id, far->outer_header_creation.teid,
+            far->outer_header_creation_len);
+
         if (far->outer_header_creation.teid) {
+            ogs_info("UPF controller FAR %u: adding outer_header_creation dest_ip=%s",
+                far->id, far_dest_ip_to_str(far));
             if (!json_append(json, sizeof(json), &off,
-                        ",\"outer_header_creation\":{"
-                        "\"teid\":%u,"
-                        "\"dest_ip\":\"%s\"}",
-                        far->outer_header_creation.teid,
-                        far_dest_ip_to_str(far)))
-                return OGS_ERROR;
+                ",\"outer_header_creation\":{"
+                "\"teid\":%u,"
+                "\"dest_ip\":\"%s\"}",
+                far->outer_header_creation.teid,
+                far_dest_ip_to_str(far)))
+            return OGS_ERROR;
         }
 
         if (!json_append(json, sizeof(json), &off, "}"))

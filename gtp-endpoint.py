@@ -226,7 +226,6 @@ def main():
     parser.add_argument("--control-ip", default="127.0.0.1", help="Control Socket IP")
     parser.add_argument("--control-port", type=int, default=5555, help="Control Socket Port")
     parser.add_argument("--tun-name", default="gtp0")
-    parser.add_argument("--setup-iface", action="store_true")
     
     # Optional defaults if mapping is missed
     parser.add_argument("--default-remote-ip", help="Default Remote GTP Peer")
@@ -243,9 +242,9 @@ def main():
     # 1. Setup TUN
     tun_fd, tun_name = create_tun(args.tun_name)
     tun_fd_global, tun_name_global = tun_fd, tun_name
+
+    setup_interface(tun_name)
     print(f"[+] TUN {tun_name} active.")
-    if args.setup_iface:
-        setup_interface(tun_name)
 
     # 2. Setup GTP Data Socket
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

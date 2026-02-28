@@ -169,7 +169,7 @@ static const char *far_dest_ip_to_str(const ogs_pfcp_far_t *far)
 {
     static char str[INET6_ADDRSTRLEN];
 
-    if (!far || far->outer_header_creation_len == 0)
+    if (!far)
         return "";
 
     if (far->outer_header_creation.ip6 || far->outer_header_creation.gtpu6 ||

@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,9 +16,100 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define UPF_CONTROLLER_HOST "127.0.0.1"
-#define UPF_CONTROLLER_PORT 8080
+#define UPF_CONTROLLER_DEFAULT_HOST "127.0.0.1"
+#define UPF_CONTROLLER_DEFAULT_PORT 8080
+#define UPF_CONTROLLER_CONFIG_FILE_REL "configs/upf-controller.conf"
+#define UPF_CONTROLLER_CONFIG_FILE_ETC "/etc/open5gs/upf-controller.conf"
 #define UPF_CONTROLLER_JSON_BUF_SIZE 32768
+
+static char upf_controller_host[INET6_ADDRSTRLEN] =
+    UPF_CONTROLLER_DEFAULT_HOST;
+static int upf_controller_port = UPF_CONTROLLER_DEFAULT_PORT;
+static bool upf_controller_config_loaded = false;
+
+static char *trim_ws(char *s)
+{
+    char *end;
+
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+        s++;
+
+    if (*s == '\0')
+        return s;
+
+    end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' ||
+                *end == '\n' || *end == '\r')) {
+        *end = '\0';
+        end--;
+    }
+
+    return s;
+}
+
+static void parse_upf_controller_config_file(const char *path)
+{
+    FILE *fp;
+    char line[512];
+
+    ogs_assert(path);
+
+    fp = fopen(path, "r");
+    if (!fp)
+        return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq;
+        char *key;
+        char *val;
+
+        key = trim_ws(line);
+        if (*key == '\0' || *key == '#')
+            continue;
+
+        eq = strchr(key, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+
+        val = trim_ws(eq + 1);
+        key = trim_ws(key);
+
+        if (strcmp(key, "host") == 0) {
+            if (*val) {
+                ogs_strlcpy(upf_controller_host, val,
+                        sizeof(upf_controller_host));
+            }
+        } else if (strcmp(key, "port") == 0) {
+            char *endp = NULL;
+            long p = strtol(val, &endp, 10);
+            if (endp != val && *trim_ws(endp) == '\0' && p > 0 && p <= 65535)
+                upf_controller_port = (int)p;
+        }
+    }
+
+    fclose(fp);
+}
+
+static void load_upf_controller_config_once(void)
+{
+    const char *env_path;
+
+    if (upf_controller_config_loaded)
+        return;
+
+    upf_controller_config_loaded = true;
+
+    parse_upf_controller_config_file(UPF_CONTROLLER_CONFIG_FILE_REL);
+    parse_upf_controller_config_file(UPF_CONTROLLER_CONFIG_FILE_ETC);
+
+    env_path = getenv("UPF_CONTROLLER_CONFIG");
+    if (env_path && *env_path)
+        parse_upf_controller_config_file(env_path);
+
+    ogs_info("UPF controller endpoint from config: %s:%d",
+            upf_controller_host, upf_controller_port);
+}
 
 static const char *interface_name_api(ogs_pfcp_interface_t interface)
 {
@@ -140,6 +232,8 @@ static int send_http_json_to_upf_controller(
     ogs_assert(path);
     ogs_assert(json);
 
+    load_upf_controller_config_once();
+
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         ogs_warn("UPF controller socket() failed: %s", strerror(errno));
@@ -153,8 +247,8 @@ static int send_http_json_to_upf_controller(
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(UPF_CONTROLLER_PORT);
-    if (inet_pton(AF_INET, UPF_CONTROLLER_HOST, &addr.sin_addr) != 1) {
+    addr.sin_port = htons(upf_controller_port);
+    if (inet_pton(AF_INET, upf_controller_host, &addr.sin_addr) != 1) {
         ogs_warn("UPF controller inet_pton() failed");
         close(fd);
         return OGS_ERROR;
@@ -168,13 +262,14 @@ static int send_http_json_to_upf_controller(
 
     req_len = (size_t)snprintf(request, sizeof(request),
             "%s %s HTTP/1.1\r\n"
-            "Host: " UPF_CONTROLLER_HOST ":%d\r\n"
+            "Host: %s:%d\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %zu\r\n"
             "Connection: close\r\n"
             "\r\n"
             "%s",
-            method, path, UPF_CONTROLLER_PORT, strlen(json), json);
+            method, path, upf_controller_host, upf_controller_port,
+            strlen(json), json);
 
     if (req_len >= sizeof(request)) {
         ogs_warn("UPF controller request too large");

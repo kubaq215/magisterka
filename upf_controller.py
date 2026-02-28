@@ -88,7 +88,7 @@ class Session:
     def get_tunnel(self) -> Optional[Tunnel]:
         for pdr in self.pdrs:
             far = self.fars.get(pdr.far_id)
-            if not far or not far.outer_header_creation:
+            if not far or not far.outer_header_creation or far.destination_interface == "CP_FUNCTION":
                 continue
             ohc = far.outer_header_creation
             return Tunnel(ue_ip=pdr.ue_ip, teid=ohc.teid, dest_ip=ohc.dest_ip)
@@ -98,7 +98,7 @@ class Session:
         result = []
         for pdr in self.pdrs:
             far = self.fars.get(pdr.far_id)
-            if not far:
+            if not far or far.destination_interface == "CP_FUNCTION":
                 continue
             result.append(Flow(
                 pdr_id=pdr.pdr_id,
@@ -250,9 +250,8 @@ def session_establish():
         # Parse FARs
         fars = {}
         for f in data.get('fars', []):
-            destination_interface = f['destination_interface']
             ohc = None
-            if destination_interface != "CP_FUNCTION" and f.get('outer_header_creation'):
+            if f.get('outer_header_creation'):
                 ohc = OuterHeaderCreation(
                     teid=f['outer_header_creation']['teid'],
                     dest_ip=f['outer_header_creation']['dest_ip']
@@ -260,7 +259,7 @@ def session_establish():
             fars[f['far_id']] = FAR(
                 far_id=f['far_id'],
                 apply_action=f['apply_action'],
-                destination_interface=destination_interface,
+                destination_interface=f['destination_interface'],
                 outer_header_creation=ohc
             )
         
@@ -312,16 +311,15 @@ def session_modify():
         # Parse and apply FAR updates
         for f in data.get('update_fars', []):
             far_id = f['far_id']
-            destination_interface = f.get('destination_interface')
             ohc = None
-            if destination_interface != "CP_FUNCTION" and f.get('outer_header_creation'):
+            if f.get('outer_header_creation'):
                 ohc = OuterHeaderCreation(
                     teid=f['outer_header_creation']['teid'],
                     dest_ip=f['outer_header_creation']['dest_ip']
                 )
             if far_id in session.fars:
                 session.fars[far_id].apply_action = f.get('apply_action', session.fars[far_id].apply_action)
-                session.fars[far_id].destination_interface = destination_interface
+                session.fars[far_id].destination_interface = f.get('destination_interface', session.fars[far_id].destination_interface)
                 if ohc:
                     session.fars[far_id].outer_header_creation = ohc
         

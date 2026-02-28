@@ -250,8 +250,9 @@ def session_establish():
         # Parse FARs
         fars = {}
         for f in data.get('fars', []):
+            destination_interface = f['destination_interface']
             ohc = None
-            if f.get('outer_header_creation'):
+            if destination_interface != "CP_FUNCTION" and f.get('outer_header_creation'):
                 ohc = OuterHeaderCreation(
                     teid=f['outer_header_creation']['teid'],
                     dest_ip=f['outer_header_creation']['dest_ip']
@@ -259,7 +260,7 @@ def session_establish():
             fars[f['far_id']] = FAR(
                 far_id=f['far_id'],
                 apply_action=f['apply_action'],
-                destination_interface=f['destination_interface'],
+                destination_interface=destination_interface,
                 outer_header_creation=ohc
             )
         
@@ -311,15 +312,16 @@ def session_modify():
         # Parse and apply FAR updates
         for f in data.get('update_fars', []):
             far_id = f['far_id']
+            destination_interface = f.get('destination_interface')
             ohc = None
-            if f.get('outer_header_creation'):
+            if destination_interface != "CP_FUNCTION" and f.get('outer_header_creation'):
                 ohc = OuterHeaderCreation(
                     teid=f['outer_header_creation']['teid'],
                     dest_ip=f['outer_header_creation']['dest_ip']
                 )
             if far_id in session.fars:
                 session.fars[far_id].apply_action = f.get('apply_action', session.fars[far_id].apply_action)
-                session.fars[far_id].destination_interface = f.get('destination_interface', session.fars[far_id].destination_interface)
+                session.fars[far_id].destination_interface = destination_interface
                 if ohc:
                     session.fars[far_id].outer_header_creation = ohc
         

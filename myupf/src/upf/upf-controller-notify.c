@@ -356,7 +356,7 @@ int upf_controller_notify_session_establish(upf_sess_t *sess)
                     interface_name_api(far->dst_if)))
             return OGS_ERROR;
 
-        if (far->outer_header_creation_len > 0) {
+        if (far->outer_header_creation.teid) {
             if (!json_append(json, sizeof(json), &off,
                         ",\"outer_header_creation\":{"
                         "\"teid\":%u,"

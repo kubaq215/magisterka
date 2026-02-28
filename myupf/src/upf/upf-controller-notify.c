@@ -77,8 +77,8 @@ static void parse_upf_controller_config_file(const char *path)
 
         if (strcmp(key, "host") == 0) {
             if (*val) {
-                ogs_strlcpy(upf_controller_host, val,
-                        sizeof(upf_controller_host));
+                (void)snprintf(upf_controller_host,
+                        sizeof(upf_controller_host), "%s", val);
             }
         } else if (strcmp(key, "port") == 0) {
             char *endp = NULL;

@@ -10,6 +10,7 @@ Role: Control Plane
 import logging
 import socket
 import subprocess
+import argparse
 from flask import Flask, request, jsonify
 from dataclasses import dataclass
 from typing import Optional, Dict, List
@@ -20,8 +21,20 @@ GTP_ENDPOINT_PORT = 5555
 TUN_INTERFACE = "gtp0"  # The interface OVS sends traffic to
 
 # Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [CTRL] - %(message)s')
 app = Flask(__name__)
+DEBUG_MODE = False
+
+
+def configure_logging(debug: bool):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - [CTRL] - %(levelname)s - %(message)s',
+        force=True,
+    )
+
+
+configure_logging(False)
 
 # --- Class Definitions ---
 
@@ -131,6 +144,7 @@ def gtp_add_tunnel(
     timeout: float = 1.0,
 ):
     msg = f"ADD {ue_ip} {teid} {remote_ip}\n"
+    logging.debug(f"[GTP] -> endpoint send: {msg.strip()}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
@@ -138,7 +152,9 @@ def gtp_add_tunnel(
     try:
         sock.sendto(msg.encode(), (GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT))
         resp, _ = sock.recvfrom(4096)
-        return resp.decode().strip()
+        decoded = resp.decode().strip()
+        logging.debug(f"[GTP] <- endpoint resp: {decoded}")
+        return decoded
     finally:
         sock.close()
 
@@ -147,6 +163,7 @@ def gtp_del_tunnel(
     timeout: float = 1.0,
 ):
     msg = f"DEL {ue_ip}\n"
+    logging.debug(f"[GTP] -> endpoint send: {msg.strip()}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
@@ -154,7 +171,9 @@ def gtp_del_tunnel(
     try:
         sock.sendto(msg.encode(), (GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT))
         resp, _ = sock.recvfrom(4096)
-        return resp.decode().strip()
+        decoded = resp.decode().strip()
+        logging.debug(f"[GTP] <- endpoint resp: {decoded}")
+        return decoded
     finally:
         sock.close()
 
@@ -181,6 +200,29 @@ def modify_ovs_flow(flow: Flow):
 # --- Logic ---
 
 session_store = SessionStore()
+
+
+@app.before_request
+def debug_log_request():
+    if not DEBUG_MODE:
+        return
+
+    payload = request.get_json(silent=True)
+    logging.debug(
+        f"[HTTP] {request.method} {request.path} from={request.remote_addr} payload={payload}"
+    )
+
+
+@app.after_request
+def debug_log_response(response):
+    if not DEBUG_MODE:
+        return response
+
+    body = response.get_data(as_text=True)
+    if len(body) > 500:
+        body = body[:500] + "..."
+    logging.debug(f"[HTTP] {request.method} {request.path} -> {response.status_code} body={body}")
+    return response
 
 # --- REST Endpoints ---
 
@@ -223,10 +265,12 @@ def session_establish():
         
         session = Session(session_id=session_id, pdrs=pdrs, fars=fars)
         session_store.add_session(session)
+        logging.debug(f"[STATE] session count={len(session_store.sessions_by_id)}")
         
         tunnel = session.get_tunnel()
         if tunnel:
-            gtp_add_tunnel(ue_ip=tunnel.ue_ip, teid=tunnel.teid, remote_ip=tunnel.dest_ip)
+            gtp_resp = gtp_add_tunnel(ue_ip=tunnel.ue_ip, teid=tunnel.teid, remote_ip=tunnel.dest_ip)
+            logging.debug(f"[GTP] establish add tunnel result={gtp_resp}")
         
         flows = session.get_flows()
         for flow in flows:
@@ -234,7 +278,7 @@ def session_establish():
         
         return jsonify({"status": "success", "session_id": session_id}), 200
     except Exception as e:
-        logging.error(f"[API] Establishment failed: {e}")
+        logging.exception(f"[API] Establishment failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/session/modify', methods=['PUT'])
@@ -251,6 +295,7 @@ def session_modify():
         
         old_tunnel = session.get_tunnel()
         old_flows = {f.pdr_id: f for f in session.get_flows()}
+        logging.debug(f"[STATE] old_tunnel={old_tunnel}, old_flows={len(old_flows)}")
         
         # Parse and apply PDR updates
         for p in data.get('update_pdrs', []):
@@ -280,15 +325,20 @@ def session_modify():
         
         new_tunnel = session.get_tunnel()
         new_flows = {f.pdr_id: f for f in session.get_flows()}
+        logging.debug(f"[STATE] new_tunnel={new_tunnel}, new_flows={len(new_flows)}")
         
         # Determine tunnel changes
         if old_tunnel and not new_tunnel:
-            gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+            gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+            logging.debug(f"[GTP] modify del tunnel result={gtp_resp}")
         elif not old_tunnel and new_tunnel:
-            gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
+            gtp_resp = gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
+            logging.debug(f"[GTP] modify add tunnel result={gtp_resp}")
         elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
-            gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-            gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
+            gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+            logging.debug(f"[GTP] modify swap del result={gtp_resp}")
+            gtp_resp = gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
+            logging.debug(f"[GTP] modify swap add result={gtp_resp}")
         
         # Determine flow changes
         for pdr_id, flow in new_flows.items():
@@ -303,7 +353,7 @@ def session_modify():
         
         return jsonify({"status": "success", "session_id": session_id}), 200
     except Exception as e:
-        logging.error(f"[API] Modification failed: {e}")
+        logging.exception(f"[API] Modification failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/session/delete', methods=['DELETE'])
@@ -320,20 +370,34 @@ def session_delete():
         
         tunnel = session.get_tunnel()
         if tunnel:
-            gtp_del_tunnel(ue_ip=tunnel.ue_ip)
+            gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
+            logging.debug(f"[GTP] delete tunnel result={gtp_resp}")
         
         flows = session.get_flows()
         for flow in flows:
             delete_ovs_flow(flow)
         
         session_store.remove_session(session_id)
+        logging.debug(f"[STATE] session count={len(session_store.sessions_by_id)}")
         
         return jsonify({"status": "success", "session_id": session_id}), 200
     except Exception as e:
-        logging.error(f"[API] Deletion failed: {e}")
+        logging.exception(f"[API] Deletion failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="UPF controller API")
+    parser.add_argument('--host', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=8080, help='Bind port (default: 8080)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode with verbose logs')
+    args = parser.parse_args()
+
+    DEBUG_MODE = args.debug
+    configure_logging(DEBUG_MODE)
+
+    if DEBUG_MODE:
+        logging.debug('[DEBUG] Debug mode enabled')
+
     # Listen on port 8080 for Open5GS
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host=args.host, port=args.port, debug=DEBUG_MODE)

@@ -1,40 +1,44 @@
 #!/usr/bin/env python3
 """
-upf_controller.py
-Role: Control Plane
-1. Receives complex JSON Session info from Open5GS (C-Code) via REST.
-2. Configures OVS to steer traffic into the TUN interface.
+upf_controller.py  –  Ryu-based UPF Control Plane
+
+1. Receives JSON Session info from Open5GS (C-Code) via REST (Ryu WSGI).
+2. Programs OVS flows on br0 via OpenFlow 1.3 using FlowManager.
 3. Sends simplified "ADD/DEL" commands to the Dataplane script via UDP.
+
+Usage:
+  ryu-manager upf_controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
+
+  Then point OVS at this controller:
+    ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
 """
 
+import json
 import logging
 import socket
-import subprocess
-import argparse
-from flask import Flask, request, jsonify
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 
-# Configuration
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route
+from webob import Response
+
+from openflow_flows import FlowManager
+
+# ---------------------------------------------------------------------------
+# Configuration – fill in these placeholders with your actual OVS port numbers
+# ---------------------------------------------------------------------------
 GTP_ENDPOINT_IP = "127.0.0.1"
 GTP_ENDPOINT_PORT = 5555
-TUN_INTERFACE = "gtp0"  # The interface OVS sends traffic to
 
-# Logging
-app = Flask(__name__)
-DEBUG_MODE = False
+# OVS br0 port numbers (find with: ovs-ofctl -O OpenFlow13 dump-ports-desc br0)
+OVS_PORT_ACCESS = None   # PLACEHOLDER: port number facing gNB (N3 side)
+OVS_PORT_CORE   = None   # PLACEHOLDER: port number facing gtp0/internet (N6 side)
 
-
-def configure_logging(debug: bool):
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - [CTRL] - %(levelname)s - %(message)s',
-        force=True,
-    )
-
-
-configure_logging(False)
+upf_app_name = "upf_controller_app"
 
 # --- Class Definitions ---
 
@@ -177,227 +181,341 @@ def gtp_del_tunnel(
     finally:
         sock.close()
 
-# --- OVS Flow Management ---
+# --- OVS Flow Management (OpenFlow via FlowManager) ---
 
-def add_ovs_flow(flow: Flow):
-    """Add OVS flow to route traffic. Placeholder."""
-    logging.info(f"[OVS] Adding flow PDR {flow.pdr_id}: UE {flow.ue_ip}, prec={flow.precedence}, {flow.source_interface}->{flow.destination_interface}, action={flow.apply_action}")
-    # TODO: ovs-ofctl add-flow br0 "priority={flow.precedence},ip,nw_dst={flow.ue_ip},actions=..."
-    pass
+def _flow_match_fields(flow: Flow) -> dict:
+    """Translate a UPF Flow into OFPMatch keyword args.
 
-def delete_ovs_flow(flow: Flow):
-    """Delete OVS flow for specific PDR. Placeholder."""
-    logging.info(f"[OVS] Deleting flow PDR {flow.pdr_id} for UE {flow.ue_ip}")
-    # TODO: ovs-ofctl del-flows br0 "ip,nw_dst={flow.ue_ip}"
-    pass
+    PLACEHOLDER: Adjust the match fields below to fit your OVS topology.
+    Currently matches on eth_type=IPv4 + UE IP (src or dst depending on
+    direction) + in_port.
+    """
+    fields = {"eth_type": 0x0800}
 
-def modify_ovs_flow(flow: Flow):
-    """Modify existing OVS flow. Placeholder."""
-    logging.info(f"[OVS] Modifying flow PDR {flow.pdr_id} for UE {flow.ue_ip}")
-    delete_ovs_flow(flow)
-    add_ovs_flow(flow)
+    if flow.source_interface == "ACCESS":
+        # Uplink: traffic arriving from gNB side, destined for UE IP
+        fields["ipv4_dst"] = flow.ue_ip
+        if OVS_PORT_ACCESS is not None:
+            fields["in_port"] = OVS_PORT_ACCESS
+    elif flow.source_interface == "CORE":
+        # Downlink: traffic arriving from core/internet side, from UE IP
+        fields["ipv4_src"] = flow.ue_ip
+        if OVS_PORT_CORE is not None:
+            fields["in_port"] = OVS_PORT_CORE
 
-# --- Logic ---
-
-session_store = SessionStore()
+    return fields
 
 
-@app.before_request
-def debug_log_request():
-    if not DEBUG_MODE:
+def _flow_actions(flow: Flow) -> list:
+    """Translate a UPF Flow into a list of FlowManager action dicts.
+
+    PLACEHOLDER: Adjust output ports and header rewrites to fit your topology.
+    """
+    if flow.apply_action == "BUFF":
+        # Buffering = drop for now (no output action)
+        return []
+
+    # FORW – forward to the other side
+    if flow.destination_interface == "ACCESS":
+        if OVS_PORT_ACCESS is not None:
+            return [{"type": "output", "port": OVS_PORT_ACCESS}]
+    elif flow.destination_interface == "CORE":
+        if OVS_PORT_CORE is not None:
+            return [{"type": "output", "port": OVS_PORT_CORE}]
+
+    # Fallback: flood (safe default until ports are configured)
+    return [{"type": "output", "port": 0xfffffffb}]  # OFPP_FLOOD
+
+
+def add_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
+    """Install an OVS flow for a UPF PDR via OpenFlow."""
+    logging.info(
+        "[OVS] Adding flow PDR %d: UE %s, prec=%d, %s->%s, action=%s",
+        flow.pdr_id, flow.ue_ip, flow.precedence,
+        flow.source_interface, flow.destination_interface, flow.apply_action,
+    )
+    if flow_manager is None:
+        logging.warning("[OVS] No switch connected – flow not installed")
         return
-
-    payload = request.get_json(silent=True)
-    logging.debug(
-        f"[HTTP] {request.method} {request.path} from={request.remote_addr} payload={payload}"
+    flow_manager.add_flow(
+        priority=flow.precedence,
+        match_fields=_flow_match_fields(flow),
+        actions=_flow_actions(flow),
     )
 
 
-@app.after_request
-def debug_log_response(response):
-    if not DEBUG_MODE:
-        return response
+def delete_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
+    """Delete an OVS flow for a specific PDR via OpenFlow."""
+    logging.info("[OVS] Deleting flow PDR %d for UE %s", flow.pdr_id, flow.ue_ip)
+    if flow_manager is None:
+        logging.warning("[OVS] No switch connected – flow not deleted")
+        return
+    flow_manager.delete_flow(
+        match_fields=_flow_match_fields(flow),
+        priority=flow.precedence,
+    )
 
-    body = response.get_data(as_text=True)
-    if len(body) > 500:
-        body = body[:500] + "..."
-    logging.debug(f"[HTTP] {request.method} {request.path} -> {response.status_code} body={body}")
-    return response
 
-# --- REST Endpoints ---
+def modify_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
+    """Modify an existing OVS flow (delete + re-add)."""
+    logging.info("[OVS] Modifying flow PDR %d for UE %s", flow.pdr_id, flow.ue_ip)
+    delete_ovs_flow(flow, flow_manager)
+    add_ovs_flow(flow, flow_manager)
 
-@app.route('/session/establish', methods=['POST'])
-def session_establish():
-    """Session Establishment: save session, create tunnels and OVS flows."""
-    try:
-        data = request.get_json()
-        logging.info(f"[API] Session establishment: {data}")
-        
-        session_id = data.get('session_id')
-        
-        # Parse PDRs
-        pdrs = []
-        for p in data.get('pdrs', []):
-            pdrs.append(PDR(
-                pdr_id=p['pdr_id'],
-                precedence=p['precedence'],
-                source_interface=p['source_interface'],
-                ue_ip=p['ue_ip'],
-                far_id=p['far_id'],
-                outer_header_removal=p.get('outer_header_removal', False)
-            ))
-        
-        # Parse FARs
-        fars = {}
-        for f in data.get('fars', []):
-            ohc = None
-            if f.get('outer_header_creation'):
-                ohc = OuterHeaderCreation(
-                    teid=f['outer_header_creation']['teid'],
-                    dest_ip=f['outer_header_creation']['dest_ip']
-                )
-            fars[f['far_id']] = FAR(
-                far_id=f['far_id'],
-                apply_action=f['apply_action'],
-                destination_interface=f['destination_interface'],
-                outer_header_creation=ohc
+# ---------------------------------------------------------------------------
+# Ryu App – OpenFlow switch management + WSGI REST API
+# ---------------------------------------------------------------------------
+
+class UPFControllerApp(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {"wsgi": WSGIApplication}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session_store = SessionStore()
+        self.flow_manager: Optional[FlowManager] = None
+
+        wsgi = kwargs["wsgi"]
+        wsgi.register(UPFRestController, {upf_app_name: self})
+        self.logger.info("[CTRL] Ryu UPF controller started – WSGI registered")
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        """Called when OVS connects. Store datapath and install table-miss."""
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+
+        self.flow_manager = FlowManager(datapath)
+        self.logger.info("[OVS] Switch connected: dpid=%s", datapath.id)
+
+        # Table-miss: send unmatched packets to controller
+        self.flow_manager.add_flow(
+            priority=0,
+            actions=[{"type": "output", "port": ofproto.OFPP_CONTROLLER,
+                       "max_length": ofproto.OFPCML_NO_BUFFER}],
+        )
+        self.logger.info("[OVS] Installed table-miss flow")
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        """Handle packets sent to controller (table-miss). Flood by default."""
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.match["in_port"]
+
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None,
+        )
+        datapath.send_msg(out)
+
+
+# ---------------------------------------------------------------------------
+# REST Controller – handles /session/* endpoints via Ryu WSGI
+# ---------------------------------------------------------------------------
+
+def _json_response(body: dict, status: int = 200) -> Response:
+    return Response(
+        content_type="application/json",
+        body=json.dumps(body),
+        status=status,
+    )
+
+
+def _parse_request_json(req) -> dict:
+    return json.loads(req.body.decode("utf-8"))
+
+
+def _parse_session(data: dict) -> Session:
+    """Parse a session establish JSON payload into a Session object."""
+    pdrs = []
+    for p in data.get("pdrs", []):
+        pdrs.append(PDR(
+            pdr_id=p["pdr_id"],
+            precedence=p["precedence"],
+            source_interface=p["source_interface"],
+            ue_ip=p["ue_ip"],
+            far_id=p["far_id"],
+            outer_header_removal=p.get("outer_header_removal", False),
+        ))
+
+    fars = {}
+    for f in data.get("fars", []):
+        ohc = None
+        if f.get("outer_header_creation"):
+            ohc = OuterHeaderCreation(
+                teid=f["outer_header_creation"]["teid"],
+                dest_ip=f["outer_header_creation"]["dest_ip"],
             )
-        
-        session = Session(session_id=session_id, pdrs=pdrs, fars=fars)
-        session_store.add_session(session)
-        logging.debug(f"[STATE] session count={len(session_store.sessions_by_id)}")
-        
-        tunnel = session.get_tunnel()
-        if tunnel:
-            gtp_resp = gtp_add_tunnel(ue_ip=tunnel.ue_ip, teid=tunnel.teid, remote_ip=tunnel.dest_ip)
-            logging.debug(f"[GTP] establish add tunnel result={gtp_resp}")
-        
-        flows = session.get_flows()
-        for flow in flows:
-            add_ovs_flow(flow)
-        
-        return jsonify({"status": "success", "session_id": session_id}), 200
-    except Exception as e:
-        logging.exception(f"[API] Establishment failed: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        fars[f["far_id"]] = FAR(
+            far_id=f["far_id"],
+            apply_action=f["apply_action"],
+            destination_interface=f["destination_interface"],
+            outer_header_creation=ohc,
+        )
 
-@app.route('/session/modify', methods=['PUT'])
-def session_modify():
-    """Session Modification: update PDR/FAR, modify tunnels/flows as needed."""
-    try:
-        data = request.get_json()
-        logging.info(f"[API] Session modification: {data}")
-        
-        session_id = data.get('session_id')
-        session = session_store.sessions_by_id.get(session_id)
-        if not session:
-            return jsonify({"status": "error", "message": "Session not found"}), 404
-        
-        old_tunnel = session.get_tunnel()
-        old_flows = {f.pdr_id: f for f in session.get_flows()}
-        logging.debug(f"[STATE] old_tunnel={old_tunnel}, old_flows={len(old_flows)}")
-        
-        # Parse and apply PDR updates
-        for p in data.get('update_pdrs', []):
-            pdr_id = p['pdr_id']
-            existing = next((pdr for pdr in session.pdrs if pdr.pdr_id == pdr_id), None)
-            if existing:
-                existing.precedence = p.get('precedence', existing.precedence)
-                existing.source_interface = p.get('source_interface', existing.source_interface)
-                existing.ue_ip = p.get('ue_ip', existing.ue_ip)
-                existing.far_id = p.get('far_id', existing.far_id)
-                existing.outer_header_removal = p.get('outer_header_removal', existing.outer_header_removal)
-        
-        # Parse and apply FAR updates
-        for f in data.get('update_fars', []):
-            far_id = f['far_id']
-            ohc = None
-            if f.get('outer_header_creation'):
-                ohc = OuterHeaderCreation(
-                    teid=f['outer_header_creation']['teid'],
-                    dest_ip=f['outer_header_creation']['dest_ip']
+    return Session(session_id=data.get("session_id"), pdrs=pdrs, fars=fars)
+
+
+class UPFRestController(ControllerBase):
+
+    def __init__(self, req, link, data, **config):
+        super().__init__(req, link, data, **config)
+        self.app: UPFControllerApp = data[upf_app_name]
+
+    # --- POST /session/establish -------------------------------------------
+
+    @route("upf", "/session/establish", methods=["POST"])
+    def session_establish(self, req, **kwargs):
+        """Session Establishment: save session, create tunnels and OVS flows."""
+        try:
+            data = _parse_request_json(req)
+            logging.info("[API] Session establishment: %s", data)
+
+            session = _parse_session(data)
+            self.app.session_store.add_session(session)
+            logging.debug("[STATE] session count=%d",
+                          len(self.app.session_store.sessions_by_id))
+
+            tunnel = session.get_tunnel()
+            if tunnel:
+                gtp_resp = gtp_add_tunnel(
+                    ue_ip=tunnel.ue_ip, teid=tunnel.teid,
+                    remote_ip=tunnel.dest_ip,
                 )
-            if far_id in session.fars:
-                session.fars[far_id].apply_action = f.get('apply_action', session.fars[far_id].apply_action)
-                session.fars[far_id].destination_interface = f.get('destination_interface', session.fars[far_id].destination_interface)
-                if ohc:
-                    session.fars[far_id].outer_header_creation = ohc
-        
-        new_tunnel = session.get_tunnel()
-        new_flows = {f.pdr_id: f for f in session.get_flows()}
-        logging.debug(f"[STATE] new_tunnel={new_tunnel}, new_flows={len(new_flows)}")
-        
-        # Determine tunnel changes
-        if old_tunnel and not new_tunnel:
-            gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-            logging.debug(f"[GTP] modify del tunnel result={gtp_resp}")
-        elif not old_tunnel and new_tunnel:
-            gtp_resp = gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
-            logging.debug(f"[GTP] modify add tunnel result={gtp_resp}")
-        elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
-            gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-            logging.debug(f"[GTP] modify swap del result={gtp_resp}")
-            gtp_resp = gtp_add_tunnel(ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid, remote_ip=new_tunnel.dest_ip)
-            logging.debug(f"[GTP] modify swap add result={gtp_resp}")
-        
-        # Determine flow changes
-        for pdr_id, flow in new_flows.items():
-            if pdr_id not in old_flows:
-                add_ovs_flow(flow)
-            elif flow != old_flows[pdr_id]:
-                modify_ovs_flow(flow)
-        
-        for pdr_id, flow in old_flows.items():
-            if pdr_id not in new_flows:
-                delete_ovs_flow(flow)
-        
-        return jsonify({"status": "success", "session_id": session_id}), 200
-    except Exception as e:
-        logging.exception(f"[API] Modification failed: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+                logging.debug("[GTP] establish add tunnel result=%s", gtp_resp)
 
-@app.route('/session/delete', methods=['DELETE'])
-def session_delete():
-    """Session Deletion: delete flows, tunnels, and session data."""
-    try:
-        data = request.get_json()
-        logging.info(f"[API] Session deletion: {data}")
-        
-        session_id = data.get('session_id')
-        session = session_store.sessions_by_id.get(session_id)
-        if not session:
-            return jsonify({"status": "error", "message": "Session not found"}), 404
-        
-        tunnel = session.get_tunnel()
-        if tunnel:
-            gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
-            logging.debug(f"[GTP] delete tunnel result={gtp_resp}")
-        
-        flows = session.get_flows()
-        for flow in flows:
-            delete_ovs_flow(flow)
-        
-        session_store.remove_session(session_id)
-        logging.debug(f"[STATE] session count={len(session_store.sessions_by_id)}")
-        
-        return jsonify({"status": "success", "session_id": session_id}), 200
-    except Exception as e:
-        logging.exception(f"[API] Deletion failed: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+            for flow in session.get_flows():
+                add_ovs_flow(flow, self.app.flow_manager)
 
+            return _json_response(
+                {"status": "success", "session_id": session.session_id})
+        except Exception as e:
+            logging.exception("[API] Establishment failed: %s", e)
+            return _json_response({"status": "error", "message": str(e)}, 500)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="UPF controller API")
-    parser.add_argument('--host', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
-    parser.add_argument('--port', type=int, default=8080, help='Bind port (default: 8080)')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode with verbose logs')
-    args = parser.parse_args()
+    # --- PUT /session/modify -----------------------------------------------
 
-    DEBUG_MODE = args.debug
-    configure_logging(DEBUG_MODE)
+    @route("upf", "/session/modify", methods=["PUT"])
+    def session_modify(self, req, **kwargs):
+        """Session Modification: update PDR/FAR, modify tunnels/flows."""
+        try:
+            data = _parse_request_json(req)
+            logging.info("[API] Session modification: %s", data)
 
-    if DEBUG_MODE:
-        logging.debug('[DEBUG] Debug mode enabled')
+            session_id = data.get("session_id")
+            session = self.app.session_store.sessions_by_id.get(session_id)
+            if not session:
+                return _json_response(
+                    {"status": "error", "message": "Session not found"}, 404)
 
-    # Listen on port 8080 for Open5GS
-    app.run(host=args.host, port=args.port, debug=DEBUG_MODE)
+            old_tunnel = session.get_tunnel()
+            old_flows = {f.pdr_id: f for f in session.get_flows()}
+
+            # Apply PDR updates
+            for p in data.get("update_pdrs", []):
+                pdr_id = p["pdr_id"]
+                existing = next(
+                    (pdr for pdr in session.pdrs if pdr.pdr_id == pdr_id), None)
+                if existing:
+                    existing.precedence = p.get("precedence", existing.precedence)
+                    existing.source_interface = p.get(
+                        "source_interface", existing.source_interface)
+                    existing.ue_ip = p.get("ue_ip", existing.ue_ip)
+                    existing.far_id = p.get("far_id", existing.far_id)
+                    existing.outer_header_removal = p.get(
+                        "outer_header_removal", existing.outer_header_removal)
+
+            # Apply FAR updates
+            for f in data.get("update_fars", []):
+                far_id = f["far_id"]
+                ohc = None
+                if f.get("outer_header_creation"):
+                    ohc = OuterHeaderCreation(
+                        teid=f["outer_header_creation"]["teid"],
+                        dest_ip=f["outer_header_creation"]["dest_ip"],
+                    )
+                if far_id in session.fars:
+                    session.fars[far_id].apply_action = f.get(
+                        "apply_action", session.fars[far_id].apply_action)
+                    session.fars[far_id].destination_interface = f.get(
+                        "destination_interface",
+                        session.fars[far_id].destination_interface)
+                    if ohc:
+                        session.fars[far_id].outer_header_creation = ohc
+
+            new_tunnel = session.get_tunnel()
+            new_flows = {f.pdr_id: f for f in session.get_flows()}
+
+            # Tunnel changes
+            if old_tunnel and not new_tunnel:
+                gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+                logging.debug("[GTP] modify del tunnel result=%s", gtp_resp)
+            elif not old_tunnel and new_tunnel:
+                gtp_resp = gtp_add_tunnel(
+                    ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
+                    remote_ip=new_tunnel.dest_ip)
+                logging.debug("[GTP] modify add tunnel result=%s", gtp_resp)
+            elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
+                gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+                gtp_add_tunnel(
+                    ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
+                    remote_ip=new_tunnel.dest_ip)
+
+            # Flow changes
+            fm = self.app.flow_manager
+            for pdr_id, flow in new_flows.items():
+                if pdr_id not in old_flows:
+                    add_ovs_flow(flow, fm)
+                elif flow != old_flows[pdr_id]:
+                    modify_ovs_flow(flow, fm)
+
+            for pdr_id, flow in old_flows.items():
+                if pdr_id not in new_flows:
+                    delete_ovs_flow(flow, fm)
+
+            return _json_response(
+                {"status": "success", "session_id": session_id})
+        except Exception as e:
+            logging.exception("[API] Modification failed: %s", e)
+            return _json_response({"status": "error", "message": str(e)}, 500)
+
+    # --- DELETE /session/delete --------------------------------------------
+
+    @route("upf", "/session/delete", methods=["DELETE"])
+    def session_delete(self, req, **kwargs):
+        """Session Deletion: delete flows, tunnels, and session data."""
+        try:
+            data = _parse_request_json(req)
+            logging.info("[API] Session deletion: %s", data)
+
+            session_id = data.get("session_id")
+            session = self.app.session_store.sessions_by_id.get(session_id)
+            if not session:
+                return _json_response(
+                    {"status": "error", "message": "Session not found"}, 404)
+
+            tunnel = session.get_tunnel()
+            if tunnel:
+                gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
+                logging.debug("[GTP] delete tunnel result=%s", gtp_resp)
+
+            fm = self.app.flow_manager
+            for flow in session.get_flows():
+                delete_ovs_flow(flow, fm)
+
+            self.app.session_store.remove_session(session_id)
+            logging.debug("[STATE] session count=%d",
+                          len(self.app.session_store.sessions_by_id))
+
+            return _json_response(
+                {"status": "success", "session_id": session_id})
+        except Exception as e:
+            logging.exception("[API] Deletion failed: %s", e)
+            return _json_response({"status": "error", "message": str(e)}, 500)

@@ -1,119 +1,73 @@
 """
-Example script: Send OpenFlow 1.3 messages to create OVS flows using Ryu.
+OpenFlow 1.3 flow manager using Ryu – importable module with add/delete API.
 
-Usage:
-  1. Start OVS bridge: ovs-vsctl add-br br0 -- set bridge br0 protocols=OpenFlow13
-  2. Point OVS to this controller: ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
-  3. Run this script: ryu-manager openflow_flows.py
+Can be used in two ways:
+
+  1. As a standalone Ryu app:
+       ryu-manager openflow_flows.py
+
+  2. Imported from another Ryu app:
+       from openflow_flows import FlowManager
+
+       # In your RyuApp, after obtaining a datapath:
+       fm = FlowManager(datapath)
+       fm.add_flow(priority=20, match_fields={"eth_type": 0x0800, "ipv4_src": "10.0.0.1"},
+                   actions=[{"type": "output", "port": 2}])
+       fm.delete_flow(match_fields={"eth_type": 0x0800, "ipv4_src": "10.0.0.1"})
+       fm.delete_all_flows()
 
 Requires: pip install ryu
 """
+
+import logging
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ipv4, arp
 
 
-class FlowInstaller(app_manager.RyuApp):
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+log = logging.getLogger(__name__)
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mac_to_port = {}
 
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        """Called when a switch connects. Install default and custom flows."""
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+# ---------------------------------------------------------------------------
+# FlowManager – importable helper, operates on a single datapath
+# ---------------------------------------------------------------------------
 
-        self.logger.info("Switch connected: dpid=%s", datapath.id)
+class FlowManager:
+    """High-level API for adding / deleting OpenFlow 1.3 flows on a datapath."""
 
-        # --- Flow 1: Default table-miss rule (send to controller) ---
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
-        self._add_flow(datapath, priority=0, match=match, actions=actions)
-        self.logger.info("Installed table-miss flow (send to controller)")
+    def __init__(self, datapath):
+        self.datapath = datapath
+        self.ofproto = datapath.ofproto
+        self.parser = datapath.ofproto_parser
 
-        # --- Flow 2: Forward all ARP traffic to all ports (flood) ---
-        match = parser.OFPMatch(eth_type=0x0806)
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        self._add_flow(datapath, priority=10, match=match, actions=actions)
-        self.logger.info("Installed ARP flood flow")
+    # -- public API ---------------------------------------------------------
 
-        # --- Flow 3: Forward IP traffic 10.0.0.1 -> 10.0.0.2 to port 2 ---
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src="10.0.0.1",
-            ipv4_dst="10.0.0.2",
-        )
-        actions = [parser.OFPActionOutput(2)]
-        self._add_flow(datapath, priority=20, match=match, actions=actions)
-        self.logger.info("Installed IP flow: 10.0.0.1 -> 10.0.0.2 => port 2")
+    def add_flow(self, priority, match_fields=None, actions=None,
+                 table_id=0, idle_timeout=0, hard_timeout=0):
+        """Add a flow entry.
 
-        # --- Flow 4: Forward IP traffic 10.0.0.2 -> 10.0.0.1 to port 1 ---
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src="10.0.0.2",
-            ipv4_dst="10.0.0.1",
-        )
-        actions = [parser.OFPActionOutput(1)]
-        self._add_flow(datapath, priority=20, match=match, actions=actions)
-        self.logger.info("Installed IP flow: 10.0.0.2 -> 10.0.0.1 => port 1")
+        Args:
+            priority:      Flow priority (higher = matched first).
+            match_fields:  Dict of OFPMatch keyword args, e.g.
+                           {"eth_type": 0x0800, "ipv4_src": "10.0.0.1"}.
+            actions:       List of action dicts, each with a "type" key:
+                           - {"type": "output",    "port": 2}
+                           - {"type": "set_field", "field": "eth_dst",
+                              "value": "00:00:00:00:00:02"}
+                           - {"type": "drop"} or None/[] for drop
+            table_id:      Flow table (default 0).
+            idle_timeout:  Seconds idle before removal (0 = permanent).
+            hard_timeout:  Seconds before forced removal (0 = permanent).
+        """
+        match = self.parser.OFPMatch(**(match_fields or {}))
+        ofp_actions = self._build_actions(actions)
+        inst = [self.parser.OFPInstructionActions(
+            self.ofproto.OFPIT_APPLY_ACTIONS, ofp_actions)]
 
-        # --- Flow 5: Drop all traffic from 10.0.0.99 (no actions = drop) ---
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src="10.0.0.99",
-        )
-        self._add_flow(datapath, priority=30, match=match, actions=[])
-        self.logger.info("Installed DROP flow for src 10.0.0.99")
-
-        # --- Flow 6: Match on TCP dst port 80, set output + rewrite dst MAC ---
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ip_proto=6,
-            tcp_dst=80,
-        )
-        actions = [
-            parser.OFPActionSetField(eth_dst="00:00:00:00:00:02"),
-            parser.OFPActionOutput(2),
-        ]
-        self._add_flow(datapath, priority=25, match=match, actions=actions)
-        self.logger.info("Installed HTTP redirect flow (tcp/80 => port 2, rewrite MAC)")
-
-        # --- Flow 7: Meter + group example – rate-limit UDP to 1 Mbps ---
-        self._install_meter(datapath, meter_id=1, rate_kbps=1000)
-        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17)
-        inst = [
-            parser.OFPInstructionMeter(1),
-            parser.OFPInstructionActions(
-                ofproto.OFPIT_APPLY_ACTIONS,
-                [parser.OFPActionOutput(ofproto.OFPP_NORMAL)],
-            ),
-        ]
-        self._add_flow(datapath, priority=15, match=match, actions=None,
-                        instructions=inst)
-        self.logger.info("Installed metered UDP flow (1 Mbps)")
-
-    def _add_flow(self, datapath, priority, match, actions, instructions=None,
-                  table_id=0, idle_timeout=0, hard_timeout=0):
-        """Helper: send an OFPFlowMod to install a flow entry."""
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        if instructions is None:
-            inst = [parser.OFPInstructionActions(
-                ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        else:
-            inst = instructions
-
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
+        mod = self.parser.OFPFlowMod(
+            datapath=self.datapath,
             table_id=table_id,
             priority=priority,
             idle_timeout=idle_timeout,
@@ -121,61 +75,172 @@ class FlowInstaller(app_manager.RyuApp):
             match=match,
             instructions=inst,
         )
-        datapath.send_msg(mod)
+        self.datapath.send_msg(mod)
+        log.info("ADD flow: priority=%d match=%s actions=%s",
+                 priority, match_fields, actions)
 
-    def _install_meter(self, datapath, meter_id, rate_kbps):
-        """Install a meter band that drops traffic exceeding rate_kbps."""
-        parser = datapath.ofproto_parser
+    def delete_flow(self, match_fields=None, priority=None, table_id=0,
+                    out_port=None, out_group=None):
+        """Delete flow entries matching the given criteria.
+
+        Args:
+            match_fields:  Dict of OFPMatch keyword args to match against.
+                           Use None/{} to match all entries in the table.
+            priority:      If set, delete only the entry with this exact
+                           priority (uses OFPFC_DELETE_STRICT).
+            table_id:      Table to delete from (default 0).
+            out_port:      Restrict to flows outputting to this port.
+            out_group:     Restrict to flows referencing this group.
+        """
+        match = self.parser.OFPMatch(**(match_fields or {}))
+
+        kwargs = dict(
+            datapath=self.datapath,
+            table_id=table_id,
+            match=match,
+            out_port=out_port or self.ofproto.OFPP_ANY,
+            out_group=out_group or self.ofproto.OFPG_ANY,
+        )
+
+        if priority is not None:
+            kwargs["command"] = self.ofproto.OFPFC_DELETE_STRICT
+            kwargs["priority"] = priority
+        else:
+            kwargs["command"] = self.ofproto.OFPFC_DELETE
+
+        mod = self.parser.OFPFlowMod(**kwargs)
+        self.datapath.send_msg(mod)
+        log.info("DELETE flow: match=%s priority=%s table=%d",
+                 match_fields, priority, table_id)
+
+    def delete_all_flows(self, table_id=None):
+        """Delete every flow entry. If table_id is None, clear all tables."""
+        tid = table_id if table_id is not None else self.ofproto.OFPTT_ALL
+        match = self.parser.OFPMatch()
+        mod = self.parser.OFPFlowMod(
+            datapath=self.datapath,
+            command=self.ofproto.OFPFC_DELETE,
+            table_id=tid,
+            match=match,
+            out_port=self.ofproto.OFPP_ANY,
+            out_group=self.ofproto.OFPG_ANY,
+        )
+        self.datapath.send_msg(mod)
+        log.info("DELETE ALL flows (table=%s)", table_id)
+
+    # -- internal -----------------------------------------------------------
+
+    def _build_actions(self, action_list):
+        """Convert a list of action dicts to Ryu OFPAction objects."""
+        if not action_list:
+            return []
+        result = []
+        for a in action_list:
+            atype = a.get("type", "drop")
+            if atype == "output":
+                port = a["port"]
+                max_len = a.get("max_length", 0)
+                result.append(self.parser.OFPActionOutput(port, max_len))
+            elif atype == "set_field":
+                result.append(
+                    self.parser.OFPActionSetField(**{a["field"]: a["value"]}))
+            elif atype == "drop":
+                pass  # empty action list = drop
+            else:
+                raise ValueError(f"Unknown action type: {atype!r}")
+        return result
+
+
+# ---------------------------------------------------------------------------
+# FlowInstallerApp – standalone Ryu app with example flows
+# ---------------------------------------------------------------------------
+
+class FlowInstallerApp(app_manager.RyuApp):
+    """Ryu app that installs example flows on switch connect.
+
+    Run directly:  ryu-manager openflow_flows.py
+    """
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.datapaths = {}   # dpid -> FlowManager
+
+    def _get_fm(self, datapath):
+        dpid = datapath.id
+        if dpid not in self.datapaths:
+            self.datapaths[dpid] = FlowManager(datapath)
+        return self.datapaths[dpid]
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        """Install example flows when a switch connects."""
+        datapath = ev.msg.datapath
+        fm = self._get_fm(datapath)
         ofproto = datapath.ofproto
 
-        bands = [parser.OFPMeterBandDrop(rate=rate_kbps, burst_size=10)]
-        req = parser.OFPMeterMod(
-            datapath=datapath,
-            command=ofproto.OFPMC_ADD,
-            flags=ofproto.OFPMF_KBPS,
-            meter_id=meter_id,
-            bands=bands,
+        self.logger.info("Switch connected: dpid=%s", datapath.id)
+
+        # Table-miss: send to controller
+        fm.add_flow(
+            priority=0,
+            actions=[{"type": "output", "port": ofproto.OFPP_CONTROLLER,
+                       "max_length": ofproto.OFPCML_NO_BUFFER}],
         )
-        datapath.send_msg(req)
+
+        # ARP flood
+        fm.add_flow(
+            priority=10,
+            match_fields={"eth_type": 0x0806},
+            actions=[{"type": "output", "port": ofproto.OFPP_FLOOD}],
+        )
+
+        # IP 10.0.0.1 -> 10.0.0.2 => port 2
+        fm.add_flow(
+            priority=20,
+            match_fields={"eth_type": 0x0800,
+                           "ipv4_src": "10.0.0.1", "ipv4_dst": "10.0.0.2"},
+            actions=[{"type": "output", "port": 2}],
+        )
+
+        # IP 10.0.0.2 -> 10.0.0.1 => port 1
+        fm.add_flow(
+            priority=20,
+            match_fields={"eth_type": 0x0800,
+                           "ipv4_src": "10.0.0.2", "ipv4_dst": "10.0.0.1"},
+            actions=[{"type": "output", "port": 1}],
+        )
+
+        # Drop all from 10.0.0.99
+        fm.add_flow(
+            priority=30,
+            match_fields={"eth_type": 0x0800, "ipv4_src": "10.0.0.99"},
+            actions=[],
+        )
+
+        # TCP/80 => rewrite dst MAC + output port 2
+        fm.add_flow(
+            priority=25,
+            match_fields={"eth_type": 0x0800, "ip_proto": 6, "tcp_dst": 80},
+            actions=[
+                {"type": "set_field", "field": "eth_dst",
+                 "value": "00:00:00:00:00:02"},
+                {"type": "output", "port": 2},
+            ],
+        )
+
+        self.logger.info("All example flows installed")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle packets sent to the controller (table-miss)."""
+        """Flood unknown packets."""
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
 
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-        if eth is None:
-            return
-
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
-
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src] = in_port
-
-        # If we know the destination port, install a flow and forward;
-        # otherwise flood.
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
-            out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # Learn path: install a flow so future packets don't hit controller
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            self._add_flow(datapath, priority=1, match=match, actions=actions,
-                           idle_timeout=300)
-            self.logger.info("Learned: %s -> port %s (dpid %s)", dst, out_port, dpid)
-
-        # Send the buffered packet out
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,

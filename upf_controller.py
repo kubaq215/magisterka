@@ -211,7 +211,7 @@ def _flow_actions(flow: Flow) -> list:
 
     PLACEHOLDER: Adjust output ports and header rewrites to fit your topology.
     """
-    if flow.apply_action == "BUFF":
+    if flow.apply_action in ("BUFF", "DROP"):
         # Buffering = drop for now (no output action)
         return []
 
@@ -323,6 +323,7 @@ class UPFControllerApp(app_manager.RyuApp):
 def _json_response(body: dict, status: int = 200) -> Response:
     return Response(
         content_type="application/json",
+        charset="utf-8",
         body=json.dumps(body),
         status=status,
     )
@@ -385,11 +386,14 @@ class UPFRestController(ControllerBase):
 
             tunnel = session.get_tunnel()
             if tunnel:
-                gtp_resp = gtp_add_tunnel(
-                    ue_ip=tunnel.ue_ip, teid=tunnel.teid,
-                    remote_ip=tunnel.dest_ip,
-                )
-                logging.debug("[GTP] establish add tunnel result=%s", gtp_resp)
+                try:
+                    gtp_resp = gtp_add_tunnel(
+                        ue_ip=tunnel.ue_ip, teid=tunnel.teid,
+                        remote_ip=tunnel.dest_ip,
+                    )
+                    logging.debug("[GTP] establish add tunnel result=%s", gtp_resp)
+                except socket.timeout:
+                    logging.warning("[GTP] Tunnel add timed out (gtp-endpoint not running?)")
 
             for flow in session.get_flows():
                 add_ovs_flow(flow, self.app.flow_manager)
@@ -454,19 +458,22 @@ class UPFRestController(ControllerBase):
             new_flows = {f.pdr_id: f for f in session.get_flows()}
 
             # Tunnel changes
-            if old_tunnel and not new_tunnel:
-                gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-                logging.debug("[GTP] modify del tunnel result=%s", gtp_resp)
-            elif not old_tunnel and new_tunnel:
-                gtp_resp = gtp_add_tunnel(
-                    ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
-                    remote_ip=new_tunnel.dest_ip)
-                logging.debug("[GTP] modify add tunnel result=%s", gtp_resp)
-            elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
-                gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-                gtp_add_tunnel(
-                    ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
-                    remote_ip=new_tunnel.dest_ip)
+            try:
+                if old_tunnel and not new_tunnel:
+                    gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+                    logging.debug("[GTP] modify del tunnel result=%s", gtp_resp)
+                elif not old_tunnel and new_tunnel:
+                    gtp_resp = gtp_add_tunnel(
+                        ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
+                        remote_ip=new_tunnel.dest_ip)
+                    logging.debug("[GTP] modify add tunnel result=%s", gtp_resp)
+                elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
+                    gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+                    gtp_add_tunnel(
+                        ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
+                        remote_ip=new_tunnel.dest_ip)
+            except socket.timeout:
+                logging.warning("[GTP] Tunnel modify timed out (gtp-endpoint not running?)")
 
             # Flow changes
             fm = self.app.flow_manager
@@ -503,8 +510,11 @@ class UPFRestController(ControllerBase):
 
             tunnel = session.get_tunnel()
             if tunnel:
-                gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
-                logging.debug("[GTP] delete tunnel result=%s", gtp_resp)
+                try:
+                    gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
+                    logging.debug("[GTP] delete tunnel result=%s", gtp_resp)
+                except socket.timeout:
+                    logging.warning("[GTP] Tunnel delete timed out (gtp-endpoint not running?)")
 
             fm = self.app.flow_manager
             for flow in session.get_flows():

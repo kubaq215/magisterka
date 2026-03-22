@@ -124,7 +124,6 @@ add_project_arguments(
 subdir('configs')
 subdir('lib')
 subdir('src')
-subdir('misc')
 # Don't build the tests unless we can run them (either natively or in an exe wrapper)
 build_tests = not meson.is_cross_build() or (meson.is_cross_build() and meson.has_exe_wrapper())
 if build_tests
@@ -151,24 +150,4 @@ message('\n'.join([
 ]))
 
 
-if cppcheck.found()
-    run_target('analyze-cppcheck',
-    command : [ 'misc/static-code-analyze.sh',
-        meson.version().version_compare('>=0.55.0') ?
-          cppcheck.full_path() : cppcheck.path(),
-        meson.current_build_dir(),
-        meson.current_source_dir()
-        ]
-    )
-endif
 
-if clangtidy.found()
-    run_target('analyze-clang-tidy',
-    command : [ 'misc/static-code-analyze.sh',
-        meson.version().version_compare('>=0.55.0') ?
-          clangtidy.full_path() : clangtidy.path(),
-        meson.current_build_dir(),
-        meson.current_source_dir()
-        ]
-    )
-endif

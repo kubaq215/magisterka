@@ -25,6 +25,20 @@
 #ifndef OGS_GTP1_TYPES_H
 #define OGS_GTP1_TYPES_H
 
+/* Constants originally from ogs-crypt.h / ogs-sha2.h */
+#ifndef OGS_RAND_LEN
+#define OGS_RAND_LEN                    16
+#endif
+#ifndef OGS_AUTN_LEN
+#define OGS_AUTN_LEN                    16
+#endif
+#ifndef OGS_MAX_RES_LEN
+#define OGS_MAX_RES_LEN                 16
+#endif
+#ifndef OGS_SHA256_DIGEST_SIZE
+#define OGS_SHA256_DIGEST_SIZE           (256 / 8)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

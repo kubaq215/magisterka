@@ -19,7 +19,6 @@
 
 #include "context.h"
 #include "pfcp-path.h"
-#include "gtp-path.h"
 #include "n4-handler.h"
 #include "upf-controller-notify.h"
 

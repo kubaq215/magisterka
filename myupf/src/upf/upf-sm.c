@@ -21,7 +21,6 @@
 #include "context.h"
 #include "event.h"
 #include "pfcp-path.h"
-#include "gtp-path.h"
 
 void upf_state_initial(ogs_fsm_t *s, upf_event_t *e)
 {

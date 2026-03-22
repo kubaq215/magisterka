@@ -45,52 +45,31 @@ endif
 configure_file(output : 'upf-config.h', configuration : upf_conf)
 
 libupf_sources = files('''
-    rule-match.h
     event.h
     timer.h
     context.h
     upf-sm.h
-    gtp-path.h
     pfcp-path.h
     n4-build.h
     n4-handler.h
     upf-controller-notify.h
 
-    rule-match.c
     init.c
     event.c
     timer.c
     context.c
     upf-sm.c
     pfcp-sm.c
-    gtp-path.c
     pfcp-path.c
     n4-build.c
     n4-handler.c
     upf-controller-notify.c
 '''.split())
 
-libtins_dep = dependency('libtins',
-    version: ['>=3.4'],
-    fallback: ['libtins', 'libtins_dep'])
-
-libarp_nd = static_library('arp_nd',
-    sources : files('''
-      arp-nd.cpp
-      arp-nd.h
-    '''.split()),
-    dependencies : libtins_dep,
-    install : false)
-libarp_nd_dep = declare_dependency(
-    link_with : libarp_nd,
-    dependencies : libtins_dep)
-
 libupf = static_library('upf',
     sources : libupf_sources,
     dependencies : [
         libpfcp_dep,
-        libtun_dep,
-        libarp_nd_dep,
     ],
     install : false)
 
@@ -98,8 +77,6 @@ libupf_dep = declare_dependency(
     link_with : libupf,
     dependencies : [
         libpfcp_dep,
-        libtun_dep,
-        libarp_nd_dep,
     ])
 
 upf_sources = files('''

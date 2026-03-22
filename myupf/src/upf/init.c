@@ -18,7 +18,6 @@
  */
 
 #include "context.h"
-#include "gtp-path.h"
 #include "pfcp-path.h"
 // #include "metrics.h"
 
@@ -42,7 +41,6 @@ int upf_initialize(void)
 
     upf_context_init();
     upf_event_init();
-    upf_gtp_init();
 
     rv = ogs_pfcp_xact_init();
     if (rv != OGS_OK) return rv;
@@ -71,9 +69,6 @@ int upf_initialize(void)
     rv = upf_pfcp_open();
     if (rv != OGS_OK) return rv;
 
-    rv = upf_gtp_open();
-    if (rv != OGS_OK) return rv;
-
     thread = ogs_thread_create(upf_main, NULL);
     if (!thread) return OGS_ERROR;
 
@@ -91,7 +86,6 @@ void upf_terminate(void)
     ogs_thread_destroy(thread);
 
     upf_pfcp_close();
-    upf_gtp_close();
 
     // ogs_metrics_context_close(ogs_metrics_self());
 
@@ -102,7 +96,6 @@ void upf_terminate(void)
 
     ogs_pfcp_xact_final();
 
-    upf_gtp_final();
     upf_event_final();
 
     // upf_metrics_final();

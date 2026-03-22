@@ -25,34 +25,7 @@ conf_data.set('localstatedir', localstatedir)
 build_configs_dir = join_paths(open5gs_build_dir, 'configs')
 conf_data.set('build_configs_dir', build_configs_dir)
 
-build_subprojects_freeDiameter_extensions_dir = join_paths(
-        open5gs_build_dir, 'subprojects', 'freeDiameter', 'extensions')
-conf_data.set('build_subprojects_freeDiameter_extensions_dir',
-        build_subprojects_freeDiameter_extensions_dir)
-
-example_conf = '''
-    sample.yaml
-    attach.yaml
-    310014.yaml
-    csfb.yaml
-    volte.yaml
-    vonr.yaml
-    slice.yaml
-    srsenb.yaml
-    non3gpp.yaml
-    transfer.yaml
-'''.split()
-
-foreach file : example_conf
-    gen = configure_file(
-            input : file + '.in',
-            output : file,
-            configuration : conf_data)
-endforeach
-
 subdir('open5gs')
-subdir('freeDiameter')
 subdir('systemd')
 subdir('logrotate')
 subdir('newsyslog')
-subdir('examples')

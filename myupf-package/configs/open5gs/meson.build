@@ -20,24 +20,7 @@ meson.add_install_script(python3_exe, '-c',
         mkdir_p.format(open5gs_sysconfdir))
 
 open5gs_conf = '''
-    mme.yaml
-    sgwc.yaml
-    sgwu.yaml
-    smf.yaml
-    amf.yaml
     upf.yaml
-    hss.yaml
-    pcrf.yaml
-    nrf.yaml
-    scp.yaml
-    sepp1.yaml
-    sepp2.yaml
-    ausf.yaml
-    udm.yaml
-    udr.yaml
-    pcf.yaml
-    nssf.yaml
-    bsf.yaml
 '''.split()
 
 foreach file : open5gs_conf
@@ -48,6 +31,3 @@ foreach file : open5gs_conf
     meson.add_install_script(python3_exe, '-c',
             install_conf.format(gen, open5gs_sysconfdir))
 endforeach
-
-subdir('tls')
-subdir('hnet')

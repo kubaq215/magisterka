@@ -124,16 +124,6 @@ add_project_arguments(
 subdir('configs')
 subdir('lib')
 subdir('src')
-# Don't build the tests unless we can run them (either natively or in an exe wrapper)
-build_tests = not meson.is_cross_build() or (meson.is_cross_build() and meson.has_exe_wrapper())
-if build_tests
-    subdir('tests')
-endif
-
-# Check if the 'fuzzing' option is defined
-if get_option('fuzzing')
-    subdir('tests/fuzzing')
-endif
 
 message('\n'.join([
   '',

@@ -49,6 +49,7 @@ libupf_sources = files('''
     timer.h
     context.h
     upf-sm.h
+    gtp-path.h
     pfcp-path.h
     n4-build.h
     n4-handler.h
@@ -60,6 +61,7 @@ libupf_sources = files('''
     context.c
     upf-sm.c
     pfcp-sm.c
+    gtp-path.c
     pfcp-path.c
     n4-build.c
     n4-handler.c

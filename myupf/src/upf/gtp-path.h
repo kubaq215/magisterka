@@ -20,7 +20,6 @@
 #ifndef UPF_GTP_PATH_H
 #define UPF_GTP_PATH_H
 
-#include "ogs-tun.h"
 #include "ogs-gtp.h"
 
 #ifdef __cplusplus

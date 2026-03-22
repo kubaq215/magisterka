@@ -60,6 +60,6 @@ ovs-vsctl set bridge br0 protocols=OpenFlow13
 
 # ── Done ──
 echo "--- OVS port map ---"
-ovs-ofctl show br0
+ovs-ofctl -O OpenFlow13 show br0
 echo ""
 echo "Use the port numbers above for OVS_PORT_ACCESS / OVS_PORT_CORE in upf_controller.py"

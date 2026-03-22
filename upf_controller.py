@@ -35,8 +35,8 @@ GTP_ENDPOINT_IP = "127.0.0.1"
 GTP_ENDPOINT_PORT = 5555
 
 # OVS br0 port numbers (find with: ovs-ofctl -O OpenFlow13 dump-ports-desc br0)
-OVS_PORT_ACCESS = None   # PLACEHOLDER: port number facing gNB (N3 side)
-OVS_PORT_CORE   = None   # PLACEHOLDER: port number facing gtp0/internet (N6 side)
+OVS_PORT_ACCESS = "veth-gtp-br"   # PLACEHOLDER: port number facing gNB (N3 side)
+OVS_PORT_CORE   = "veth-ext-br"   # PLACEHOLDER: port number facing gtp0/internet (N6 side)
 
 upf_app_name = "upf_controller_app"
 

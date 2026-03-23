@@ -6,15 +6,21 @@ ovs-vsctl add-br br0
 # Then add gtp0 to OVS
 ovs-vsctl add-port br0 gtp0
 
-# Create an internal port for the kernel IP stack (routing + NAT)
-ovs-vsctl add-port br0 uplink -- set interface uplink type=internal
-ip addr add 10.45.0.1/16 dev uplink
-ip link set uplink up
+# Create veth pair: veth-ovs goes into OVS, veth-ext stays in kernel
+ip link add veth-ovs type veth peer name veth-ext
+ip link set veth-ovs up
+ip link set veth-ext up
+
+# Add one end to OVS
+ovs-vsctl add-port br0 veth-ovs
+
+# Assign UE subnet IP to the kernel-side end (for routing + NAT)
+ip addr add 10.45.0.1/16 dev veth-ext
 
 # Remove the old IP from gtp0 (OVS handles it now)
 ip addr flush dev gtp0
 
-# NAT via uplink
+# NAT via veth-ext
 iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
 
 # Enable forwarding

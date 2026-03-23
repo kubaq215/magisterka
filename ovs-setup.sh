@@ -31,21 +31,12 @@ ip route add 10.45.0.0/16 via 10.99.0.2 dev veth-ext
 # (nothing on the OVS side answers ARP requests)
 ip neigh add 10.99.0.2 lladdr 02:00:00:00:00:02 nud permanent dev veth-ext
 
-# Remove the old IP from gtp0 (OVS handles it now)
-ip addr flush dev gtp0
-
-# Disable reverse-path filtering (otherwise kernel drops forwarded 10.45.x.x packets)
-sysctl -w net.ipv4.conf.all.rp_filter=0
-sysctl -w net.ipv4.conf.veth-ext.rp_filter=0
-sysctl -w net.ipv4.conf.enp0s9.rp_filter=0
-
 # Enable forwarding
 sysctl -w net.ipv4.ip_forward=1
 
 # NAT + FORWARD rules
+iptables -t nat -D POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE 2>/dev/null
 iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
-iptables -A FORWARD -i veth-ext -o enp0s9 -s 10.45.0.0/16 -j ACCEPT
-iptables -A FORWARD -i enp0s9 -o veth-ext -d 10.45.0.0/16 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 # setup controller
 ovs-vsctl set-controller br0 tcp:127.0.0.1:6653

@@ -50,7 +50,7 @@ def create_tap(name):
 
 def setup_interface(name, mtu=1500):
     subprocess.check_call(["ip", "link", "set", "dev", name, "up"])
-    subprocess.check_call(["ip", "addr", "add", "10.45.0.1/16", "dev", name])
+    # subprocess.check_call(["ip", "addr", "add", "10.45.0.1/16", "dev", name])
     subprocess.check_call(["ip", "link", "set", "dev", name, "mtu", str(mtu)])
 
 def cleanup_and_exit(signum, frame):

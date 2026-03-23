@@ -104,6 +104,8 @@ class Session:
             far = self.fars.get(pdr.far_id)
             if not far or far.destination_interface == "CP_FUNCTION":
                 continue
+            if pdr.source_interface == "CP_FUNCTION" or pdr.ue_ip == "0.0.0.0":
+                continue
             result.append(Flow(
                 pdr_id=pdr.pdr_id,
                 precedence=pdr.precedence,

@@ -1,4 +1,5 @@
 # Create OVS bridge
+ovs-vsctl del-br br0
 ovs-vsctl add-br br0
 
 # Start gtp-endpoint.py (creates gtp0 as TAP now)
@@ -14,7 +15,11 @@ ip link set uplink up
 ip addr flush dev gtp0
 
 # NAT via uplink
-iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o eth1 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
 
 # Enable forwarding
 sysctl -w net.ipv4.ip_forward=1
+
+# setup controller
+ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
+ovs-vsctl set bridge br0 protocols=OpenFlow13

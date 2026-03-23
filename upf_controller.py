@@ -193,13 +193,13 @@ def _flow_match_fields(flow: Flow) -> dict:
     fields = {"eth_type": 0x0800}
 
     if flow.source_interface == "ACCESS":
-        # Uplink: traffic arriving from gNB side, destined for UE IP
-        fields["ipv4_dst"] = flow.ue_ip
+        # Uplink: traffic arriving from gNB side, sourced from UE IP
+        fields["ipv4_src"] = flow.ue_ip
         if OVS_PORT_ACCESS is not None:
             fields["in_port"] = OVS_PORT_ACCESS
     elif flow.source_interface == "CORE":
-        # Downlink: traffic arriving from core/internet side, from UE IP
-        fields["ipv4_src"] = flow.ue_ip
+        # Downlink: traffic arriving from core/internet side, destined for UE IP
+        fields["ipv4_dst"] = flow.ue_ip
         if OVS_PORT_CORE is not None:
             fields["in_port"] = OVS_PORT_CORE
 

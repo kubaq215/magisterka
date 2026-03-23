@@ -8,23 +8,44 @@ ovs-vsctl add-port br0 gtp0
 
 # Create veth pair: veth-ovs goes into OVS, veth-ext stays in kernel
 ip link add veth-ovs type veth peer name veth-ext
+
+# Assign known MACs (locally-administered unicast) — must match gtp-endpoint.py
+ip link set veth-ext address 02:00:00:00:00:01
+ip link set gtp0   address 02:00:00:00:00:02
+
 ip link set veth-ovs up
 ip link set veth-ext up
 
 # Add one end to OVS
 ovs-vsctl add-port br0 veth-ovs
 
-# Assign UE subnet IP to the kernel-side end (for routing + NAT)
-ip addr add 10.45.0.1/16 dev veth-ext
+# Give veth-ext a transit /30 (NOT the UE /16 — that would make the
+# kernel treat UE traffic as local instead of forwarding it)
+ip addr add 10.99.0.1/30 dev veth-ext
+
+# Route UE subnet via a fake next-hop inside the /30
+# 10.99.0.2 is resolved by the static neighbor entry below
+ip route add 10.45.0.0/16 via 10.99.0.2 dev veth-ext
+
+# Static ARP so the kernel can send return traffic without real ARP resolution
+# (nothing on the OVS side answers ARP requests)
+ip neigh add 10.99.0.2 lladdr 02:00:00:00:00:02 nud permanent dev veth-ext
 
 # Remove the old IP from gtp0 (OVS handles it now)
 ip addr flush dev gtp0
 
-# NAT via veth-ext
-iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
+# Disable reverse-path filtering (otherwise kernel drops forwarded 10.45.x.x packets)
+sysctl -w net.ipv4.conf.all.rp_filter=0
+sysctl -w net.ipv4.conf.veth-ext.rp_filter=0
+sysctl -w net.ipv4.conf.enp0s9.rp_filter=0
 
 # Enable forwarding
 sysctl -w net.ipv4.ip_forward=1
+
+# NAT + FORWARD rules
+iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
+iptables -A FORWARD -i veth-ext -o enp0s9 -s 10.45.0.0/16 -j ACCEPT
+iptables -A FORWARD -i enp0s9 -o veth-ext -d 10.45.0.0/16 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 # setup controller
 ovs-vsctl set-controller br0 tcp:127.0.0.1:6653

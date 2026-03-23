@@ -28,8 +28,9 @@ IFF_NO_PI = 0x1000
 MAX_PKT   = 65535
 ETH_P_IP  = b'\x08\x00'
 ETH_P_IPV6 = b'\x86\xdd'
-ETH_BCAST = b'\xff\xff\xff\xff\xff\xff'
-ETH_ZERO  = b'\x00\x00\x00\x00\x00\x00'
+# Known MACs — must match ovs-setup.sh (locally-administered unicast)
+ETH_DST   = b'\x02\x00\x00\x00\x00\x01'  # veth-ext's MAC
+ETH_SRC   = b'\x02\x00\x00\x00\x00\x02'  # gtp0's MAC
 
 # Global State
 tun_fd_global = None
@@ -181,7 +182,7 @@ def handle_rx_gtp(sock, tun_fd, args):
         # Write to TAP (prepend Ethernet header)
         if p and (p[0] >> 4) in (4, 6):
             ethertype = ETH_P_IP if (p[0] >> 4) == 4 else ETH_P_IPV6
-            eth_hdr = ETH_BCAST + ETH_ZERO + ethertype
+            eth_hdr = ETH_DST + ETH_SRC + ethertype
             os.write(tun_fd, eth_hdr + p)
             if args.verbose:
                 print(f"[RX] GTP (TEID={gtp.teid}) -> TAP")

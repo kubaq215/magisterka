@@ -23,9 +23,13 @@ from scapy.all import IP, IPv6, Raw
 
 # --- Configuration Constants ---
 TUNSETIFF = 0x400454ca
-IFF_TUN   = 0x0001
+IFF_TAP   = 0x0002
 IFF_NO_PI = 0x1000
 MAX_PKT   = 65535
+ETH_P_IP  = b'\x08\x00'
+ETH_P_IPV6 = b'\x86\xdd'
+ETH_BCAST = b'\xff\xff\xff\xff\xff\xff'
+ETH_ZERO  = b'\x00\x00\x00\x00\x00\x00'
 
 # Global State
 tun_fd_global = None
@@ -37,9 +41,9 @@ ue_mapping = {}  # Format: { "UE_IP_STR": (TEID_INT, "REMOTE_IP_STR") }
 # Network Helpers
 # -----------------------
 
-def create_tun(name):
+def create_tap(name):
     tun_fd = os.open("/dev/net/tun", os.O_RDWR)
-    ifr = struct.pack("16sH", name.encode(), IFF_TUN | IFF_NO_PI)
+    ifr = struct.pack("16sH", name.encode(), IFF_TAP | IFF_NO_PI)
     ifs = fcntl.ioctl(tun_fd, TUNSETIFF, ifr)
     return tun_fd, ifs[:16].split(b"\x00", 1)[0].decode()
 
@@ -174,19 +178,26 @@ def handle_rx_gtp(sock, tun_fd, args):
             skip = p[0] * 4
             p = p[skip:] if len(p) >= skip else b""
         
-        # Write to TUN
+        # Write to TAP (prepend Ethernet header)
         if p and (p[0] >> 4) in (4, 6):
-            os.write(tun_fd, p)
+            ethertype = ETH_P_IP if (p[0] >> 4) == 4 else ETH_P_IPV6
+            eth_hdr = ETH_BCAST + ETH_ZERO + ethertype
+            os.write(tun_fd, eth_hdr + p)
             if args.verbose:
-                print(f"[RX] GTP (TEID={gtp.teid}) -> TUN")
+                print(f"[RX] GTP (TEID={gtp.teid}) -> TAP")
 
 
 def handle_tx_tun(tun_fd, sock, default_gw, default_teid):
-    """Read TUN -> Lookup TEID based on Dest IP -> Encapsulate GTP"""
+    """Read TAP -> Strip Ethernet header -> Lookup TEID -> Encapsulate GTP"""
     try:
-        packet = os.read(tun_fd, MAX_PKT)
+        raw = os.read(tun_fd, MAX_PKT)
     except OSError:
         return
+
+    # Strip 14-byte Ethernet header
+    if len(raw) <= 14:
+        return
+    packet = raw[14:]
 
     # Parse headers to find destination IP (The UE IP)
     kind, info = try_parse_inner_headers(packet)
@@ -239,12 +250,12 @@ def main():
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-    # 1. Setup TUN
-    tun_fd, tun_name = create_tun(args.tun_name)
+    # 1. Setup TAP
+    tun_fd, tun_name = create_tap(args.tun_name)
     tun_fd_global, tun_name_global = tun_fd, tun_name
 
     setup_interface(tun_name)
-    print(f"[+] TUN {tun_name} active.")
+    print(f"[+] TAP {tun_name} active.")
 
     # 2. Setup GTP Data Socket
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

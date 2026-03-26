@@ -33,7 +33,3 @@ ip neigh add 10.99.0.2 lladdr 02:00:00:00:00:02 nud permanent dev veth-ext
 
 # Enable forwarding
 sysctl -w net.ipv4.ip_forward=1
-
-# NAT + FORWARD rules
-iptables -t nat -D POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE 2>/dev/null
-iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE

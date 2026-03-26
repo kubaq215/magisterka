@@ -37,7 +37,3 @@ sysctl -w net.ipv4.ip_forward=1
 # NAT + FORWARD rules
 iptables -t nat -D POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE 2>/dev/null
 iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o enp0s9 -j MASQUERADE
-
-# setup controller
-ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
-ovs-vsctl set bridge br0 protocols=OpenFlow13

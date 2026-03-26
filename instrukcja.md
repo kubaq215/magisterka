@@ -17,6 +17,44 @@
 
 ---
 
+## Architecture Diagram
+
+```mermaid
+flowchart TD
+    UE(["UE<br/>(User Equipment)"])
+    GNB(["gNB<br/>(Radio Access Node)"])
+    SMF(["SMF<br/>(Session Management Function)"])
+    INTERNET(["Internet"])
+
+    subgraph MachineB["Machine B — OVS Dataplane"]
+        direction TB
+        GTP["gtp-endpoint.py<br/>(GTP-U termination)"]
+        OVS["Open vSwitch (OVS)<br/>br0"]
+        NAT["iptables NAT<br/>(MASQUERADE)"]
+        GTP --> OVS
+        OVS --> NAT
+    end
+
+    subgraph MachineA["Machine A — Control Plane"]
+        direction TB
+        UPF["open5gs-upfd<br/>(UPF / PFCP server)"]
+        TRANS["PFCP ↔ OpenFlow<br/>translation"]
+        CTRL["ryu-manager<br/>(SDN Controller)"]
+        UPF --> TRANS
+        TRANS --> CTRL
+    end
+
+    UE -- "GTP-U (N3)" --> GNB
+    GNB -- "GTP-U (N3)<br/>[&lt;GNB_IFACE&gt;]" --> GTP
+    NAT -- "[&lt;WAN_IFACE&gt;]" --> INTERNET
+
+    SMF -- "PFCP (N4)<br/>[&lt;MGMT_IFACE&gt;]" --> UPF
+    CTRL -- "OpenFlow 1.3<br/>[&lt;MGMT_IFACE&gt;]" --> OVS
+    CTRL -- "UDP :5555<br/>[&lt;MGMT_IFACE&gt;]" --> GTP
+```
+
+---
+
 ## Machine A — PFCP↔OpenFlow Translation & SDN Controller
 
 Machine A has two network interfaces:

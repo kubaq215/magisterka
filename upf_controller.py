@@ -13,8 +13,10 @@ Usage:
     ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
 """
 
+import configparser
 import json
 import logging
+import os
 import socket
 from dataclasses import dataclass
 from typing import Optional, Dict, List
@@ -29,15 +31,43 @@ from webob import Response
 from openflow_flows import FlowManager
 
 # ---------------------------------------------------------------------------
-# Configuration – fill in these placeholders with your actual OVS port numbers
+# Configuration – loaded from upf_controller.ini (or path in UPF_CONFIG env var)
 # ---------------------------------------------------------------------------
-GTP_ENDPOINT_IP = "127.0.0.1"
-GTP_ENDPOINT_PORT = 5555
+_CONFIG_FILE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upf_controller.ini")
+
+def _load_config(path: str = None) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    # built-in defaults (used when key is absent from the file)
+    cfg.read_dict({
+        "gtp": {
+            "endpoint_ip":   "127.0.0.1",
+            "endpoint_port": "5555",
+        },
+        "controller": {
+            "ip":   "127.0.0.1",
+            "port": "6653",
+        },
+        "ovs": {
+            "port_access": "1",
+            "port_core":   "2",
+        },
+    })
+    config_path = path or os.environ.get("UPF_CONFIG", _CONFIG_FILE_DEFAULT)
+    if os.path.isfile(config_path):
+        cfg.read(config_path)
+    return cfg
+
+_cfg = _load_config()
+
+GTP_ENDPOINT_IP   = _cfg.get("gtp", "endpoint_ip")
+GTP_ENDPOINT_PORT = _cfg.getint("gtp", "endpoint_port")
+CONTROLLER_IP     = _cfg.get("controller", "ip")
+CONTROLLER_PORT   = _cfg.getint("controller", "port")
 
 # OVS br0 port numbers (find with: ovs-ofctl -O OpenFlow13 dump-ports-desc br0)
 # Ports: gtp0 (TAP, access/gNB side), veth-ovs (core/internet side via veth-ext)
-OVS_PORT_ACCESS = 1  # PLACEHOLDER: gtp0 port number
-OVS_PORT_CORE   = 2  # PLACEHOLDER: veth-ovs port number
+OVS_PORT_ACCESS = _cfg.getint("ovs", "port_access")
+OVS_PORT_CORE   = _cfg.getint("ovs", "port_core")
 
 upf_app_name = "upf_controller_app"
 
@@ -280,7 +310,12 @@ class UPFControllerApp(app_manager.RyuApp):
 
         wsgi = kwargs["wsgi"]
         wsgi.register(UPFRestController, {upf_app_name: self})
+        config_path = os.environ.get("UPF_CONFIG", _CONFIG_FILE_DEFAULT)
         self.logger.info("[CTRL] Ryu UPF controller started – WSGI registered")
+        self.logger.info("[CFG]  Config file : %s%s", config_path,
+                         " (loaded)" if os.path.isfile(config_path) else " (not found, using defaults)")
+        self.logger.info("[CFG]  GTP endpoint: %s:%d", GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT)
+        self.logger.info("[CFG]  OF controller: %s:%d", CONTROLLER_IP, CONTROLLER_PORT)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):

@@ -6,6 +6,8 @@ upf_controller.py  –  Ryu-based UPF Control Plane
 2. Programs OVS flows on br0 via OpenFlow 1.3 using FlowManager.
 3. Manages GTP tunnel mappings on the dataplane via a persistent
    TCP connection with JSON + HMAC-SHA256 authentication.
+4. Persists sessions to disk and periodically reconciles state with
+   the GTP endpoint via the SYNC command.
 
 Usage:
   ryu-manager upf_controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
@@ -22,7 +24,8 @@ import logging
 import os
 import socket
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List
 
 from ryu.base import app_manager
@@ -41,7 +44,6 @@ _CONFIG_FILE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 
 def _load_config(path: str = None) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
-    # built-in defaults (used when key is absent from the file)
     cfg.read_dict({
         "gtp": {
             "endpoint_ip":   "127.0.0.1",
@@ -55,6 +57,10 @@ def _load_config(path: str = None) -> configparser.ConfigParser:
         "ovs": {
             "port_access": "1",
             "port_core":   "2",
+        },
+        "persistence": {
+            "session_file": "",
+            "reconcile_interval": "30",
         },
     })
     config_path = path or os.environ.get("UPF_CONFIG", _CONFIG_FILE_DEFAULT)
@@ -70,10 +76,13 @@ GTP_SECRET        = _cfg.get("gtp", "secret").encode() or b""
 CONTROLLER_IP     = _cfg.get("controller", "ip")
 CONTROLLER_PORT   = _cfg.getint("controller", "port")
 
-# OVS br0 port numbers (find with: ovs-ofctl -O OpenFlow13 dump-ports-desc br0)
-# Ports: gtp0 (TAP, access/gNB side), veth-ovs (core/internet side via veth-ext)
 OVS_PORT_ACCESS = _cfg.getint("ovs", "port_access")
 OVS_PORT_CORE   = _cfg.getint("ovs", "port_core")
+
+_SESSION_FILE_DEFAULT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sessions.json")
+SESSION_FILE = _cfg.get("persistence", "session_file") or _SESSION_FILE_DEFAULT
+RECONCILE_INTERVAL = _cfg.getint("persistence", "reconcile_interval")
 
 upf_app_name = "upf_controller_app"
 
@@ -153,30 +162,113 @@ class Session:
             ))
         return result
 
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "pdrs": [asdict(p) for p in self.pdrs],
+            "fars": {str(k): asdict(v) for k, v in self.fars.items()},
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "Session":
+        pdrs = [PDR(**p) for p in d["pdrs"]]
+        fars = {}
+        for k, v in d["fars"].items():
+            ohc = None
+            if v.get("outer_header_creation"):
+                ohc = OuterHeaderCreation(**v["outer_header_creation"])
+            fars[int(k)] = FAR(
+                far_id=v["far_id"],
+                apply_action=v["apply_action"],
+                destination_interface=v["destination_interface"],
+                outer_header_creation=ohc,
+            )
+        return Session(session_id=d["session_id"], pdrs=pdrs, fars=fars)
+
+
 class SessionStore:
-    def __init__(self):
+    def __init__(self, persist_path: str = ""):
         self.sessions_by_id: dict[str, Session] = {}
         self.sessions_by_ue_ip: dict[str, set[str]] = {}
+        self._persist_path = persist_path
+        self._lock = threading.Lock()
+
+    def _rebuild_ue_ip_index(self):
+        self.sessions_by_ue_ip.clear()
+        for session in self.sessions_by_id.values():
+            for pdr in session.pdrs:
+                self.sessions_by_ue_ip \
+                    .setdefault(pdr.ue_ip, set()) \
+                    .add(session.session_id)
 
     def add_session(self, session: Session):
-        self.sessions_by_id[session.session_id] = session
+        with self._lock:
+            self.sessions_by_id[session.session_id] = session
+            for pdr in session.pdrs:
+                self.sessions_by_ue_ip \
+                    .setdefault(pdr.ue_ip, set()) \
+                    .add(session.session_id)
+            self._persist()
 
-        for pdr in session.pdrs:
-            self.sessions_by_ue_ip \
-                .setdefault(pdr.ue_ip, set()) \
-                .add(session.session_id)
-    
     def remove_session(self, session_id: str):
-        session = self.sessions_by_id.pop(session_id, None)
-        if not session:
+        with self._lock:
+            session = self.sessions_by_id.pop(session_id, None)
+            if not session:
+                return
+            for pdr in session.pdrs:
+                self.sessions_by_ue_ip.get(pdr.ue_ip, set()).discard(session_id)
+            self._persist()
+
+    def update_session(self, session: Session):
+        with self._lock:
+            self.sessions_by_id[session.session_id] = session
+            self._rebuild_ue_ip_index()
+            self._persist()
+
+    def get_all_expected_tunnels(self) -> Dict[str, Tunnel]:
+        with self._lock:
+            tunnels = {}
+            for session in self.sessions_by_id.values():
+                t = session.get_tunnel()
+                if t:
+                    tunnels[t.ue_ip] = t
+            return tunnels
+
+    def get_all_expected_flows(self) -> List[Flow]:
+        with self._lock:
+            flows = []
+            for session in self.sessions_by_id.values():
+                flows.extend(session.get_flows())
+            return flows
+
+    def _persist(self):
+        if not self._persist_path:
             return
+        try:
+            data = {sid: s.to_dict() for sid, s in self.sessions_by_id.items()}
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(tmp, self._persist_path)
+        except Exception as e:
+            logging.warning("[PERSIST] Failed to save sessions: %s", e)
 
-        for pdr in session.pdrs:
-            self.sessions_by_ue_ip.get(pdr.ue_ip, set()).discard(session_id)
-
-    def get_sessions_by_ue_ip(self, ue_ip: str):
-        ids = self.sessions_by_ue_ip.get(ue_ip, set())
-        return [self.sessions_by_id[i] for i in ids]
+    def load_from_disk(self):
+        if not self._persist_path or not os.path.isfile(self._persist_path):
+            return 0
+        try:
+            with open(self._persist_path, "r") as f:
+                data = json.load(f)
+            with self._lock:
+                for sid, d in data.items():
+                    self.sessions_by_id[sid] = Session.from_dict(d)
+                self._rebuild_ue_ip_index()
+            logging.info("[PERSIST] Loaded %d sessions from %s",
+                         len(data), self._persist_path)
+            return len(data)
+        except Exception as e:
+            logging.warning("[PERSIST] Failed to load sessions: %s", e)
+            return 0
 
 # ---------------------------------------------------------------------------
 # Persistent TCP client for GTP endpoint communication (JSON + HMAC)
@@ -291,24 +383,111 @@ _gtp_client = GtpEndpointClient(
     GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT, GTP_SECRET
 )
 
+# ---------------------------------------------------------------------------
+# Reconciliation loop – periodic GTP endpoint state check
+# ---------------------------------------------------------------------------
+
+class ReconciliationLoop:
+    """Background thread that periodically reconciles GTP tunnel state."""
+
+    def __init__(self, session_store: SessionStore,
+                 gtp_client: GtpEndpointClient,
+                 interval: int = 30):
+        self._store = session_store
+        self._gtp = gtp_client
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._interval <= 0:
+            logging.info("[RECONCILE] Disabled (interval=%d)", self._interval)
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="reconcile")
+        self._thread.start()
+        logging.info("[RECONCILE] Started (interval=%ds)", self._interval)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def run_once(self):
+        try:
+            self._reconcile()
+        except Exception as e:
+            logging.warning("[RECONCILE] Failed: %s", e)
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self._reconcile()
+            except Exception as e:
+                logging.warning("[RECONCILE] Cycle failed: %s", e)
+
+    def _reconcile(self):
+        expected = self._store.get_all_expected_tunnels()
+
+        try:
+            resp = self._gtp.sync()
+        except (OSError, ConnectionError, ValueError) as e:
+            logging.warning("[RECONCILE] GTP SYNC failed: %s", e)
+            return
+
+        actual = {}
+        for m in resp.get("mappings", []):
+            actual[m["ue_ip"]] = (m["teid"], m["remote_ip"])
+
+        added = 0
+        updated = 0
+        removed = 0
+
+        # Add/update tunnels that should exist
+        for ue_ip, tunnel in expected.items():
+            if ue_ip not in actual:
+                try:
+                    self._gtp.add_tunnel(ue_ip, tunnel.teid, tunnel.dest_ip)
+                    added += 1
+                except (OSError, ConnectionError, ValueError) as e:
+                    logging.warning("[RECONCILE] Add %s failed: %s", ue_ip, e)
+            else:
+                a_teid, a_remote = actual[ue_ip]
+                if a_teid != tunnel.teid or a_remote != tunnel.dest_ip:
+                    try:
+                        self._gtp.del_tunnel(ue_ip)
+                        self._gtp.add_tunnel(ue_ip, tunnel.teid, tunnel.dest_ip)
+                        updated += 1
+                    except (OSError, ConnectionError, ValueError) as e:
+                        logging.warning("[RECONCILE] Update %s failed: %s",
+                                        ue_ip, e)
+
+        # Remove stale tunnels
+        for ue_ip in actual:
+            if ue_ip not in expected:
+                try:
+                    self._gtp.del_tunnel(ue_ip)
+                    removed += 1
+                except (OSError, ConnectionError, ValueError) as e:
+                    logging.warning("[RECONCILE] Del %s failed: %s", ue_ip, e)
+
+        if added or updated or removed:
+            logging.info("[RECONCILE] Tunnels: +%d ~%d -%d",
+                         added, updated, removed)
+        else:
+            logging.debug("[RECONCILE] GTP state in sync")
+
+
 # --- OVS Flow Management (OpenFlow via FlowManager) ---
 
 def _flow_match_fields(flow: Flow) -> dict:
-    """Translate a UPF Flow into OFPMatch keyword args.
-
-    PLACEHOLDER: Adjust the match fields below to fit your OVS topology.
-    Currently matches on eth_type=IPv4 + UE IP (src or dst depending on
-    direction) + in_port.
-    """
     fields = {"eth_type": 0x0800}
 
     if flow.source_interface == "ACCESS":
-        # Uplink: traffic arriving from gNB side, sourced from UE IP
         fields["ipv4_src"] = flow.ue_ip
         if OVS_PORT_ACCESS is not None:
             fields["in_port"] = OVS_PORT_ACCESS
     elif flow.source_interface == "CORE":
-        # Downlink: traffic arriving from core/internet side, destined for UE IP
         fields["ipv4_dst"] = flow.ue_ip
         if OVS_PORT_CORE is not None:
             fields["in_port"] = OVS_PORT_CORE
@@ -317,15 +496,9 @@ def _flow_match_fields(flow: Flow) -> dict:
 
 
 def _flow_actions(flow: Flow) -> list:
-    """Translate a UPF Flow into a list of FlowManager action dicts.
-
-    PLACEHOLDER: Adjust output ports and header rewrites to fit your topology.
-    """
     if flow.apply_action in ("BUFF", "DROP"):
-        # Buffering = drop for now (no output action)
         return []
 
-    # FORW – forward to the other side
     if flow.destination_interface == "ACCESS":
         if OVS_PORT_ACCESS is not None:
             return [{"type": "output", "port": OVS_PORT_ACCESS}]
@@ -333,12 +506,10 @@ def _flow_actions(flow: Flow) -> list:
         if OVS_PORT_CORE is not None:
             return [{"type": "output", "port": OVS_PORT_CORE}]
 
-    # Fallback: flood (safe default until ports are configured)
     return [{"type": "output", "port": 0xfffffffb}]  # OFPP_FLOOD
 
 
 def add_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
-    """Install an OVS flow for a UPF PDR via OpenFlow."""
     logging.info(
         "[OVS] Adding flow PDR %d: UE %s, prec=%d, %s->%s, action=%s",
         flow.pdr_id, flow.ue_ip, flow.precedence,
@@ -355,7 +526,6 @@ def add_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
 
 
 def delete_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
-    """Delete an OVS flow for a specific PDR via OpenFlow."""
     logging.info("[OVS] Deleting flow PDR %d for UE %s", flow.pdr_id, flow.ue_ip)
     if flow_manager is None:
         logging.warning("[OVS] No switch connected – flow not deleted")
@@ -367,7 +537,6 @@ def delete_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
 
 
 def modify_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
-    """Modify an existing OVS flow (delete + re-add)."""
     logging.info("[OVS] Modifying flow PDR %d for UE %s", flow.pdr_id, flow.ue_ip)
     delete_ovs_flow(flow, flow_manager)
     add_ovs_flow(flow, flow_manager)
@@ -382,8 +551,15 @@ class UPFControllerApp(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session_store = SessionStore()
+        self.session_store = SessionStore(persist_path=SESSION_FILE)
         self.flow_manager: Optional[FlowManager] = None
+        self._reconciler = ReconciliationLoop(
+            self.session_store, _gtp_client, RECONCILE_INTERVAL)
+
+        # Load persisted sessions from previous run
+        loaded = self.session_store.load_from_disk()
+        if loaded:
+            self.logger.info("[INIT] Restored %d sessions from disk", loaded)
 
         wsgi = kwargs["wsgi"]
         wsgi.register(UPFRestController, {upf_app_name: self})
@@ -393,17 +569,20 @@ class UPFControllerApp(app_manager.RyuApp):
                          " (loaded)" if os.path.isfile(config_path) else " (not found, using defaults)")
         self.logger.info("[CFG]  GTP endpoint: %s:%d", GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT)
         self.logger.info("[CFG]  OF controller: %s:%d", CONTROLLER_IP, CONTROLLER_PORT)
+        self.logger.info("[CFG]  Session file: %s", SESSION_FILE)
+        self.logger.info("[CFG]  Reconcile interval: %ds", RECONCILE_INTERVAL)
+
+        self._reconciler.start()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Called when OVS connects. Store datapath and install table-miss."""
+        """Called when OVS connects. Restore datapath, table-miss, and all flows."""
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
 
         self.flow_manager = FlowManager(datapath)
         self.logger.info("[OVS] Switch connected: dpid=%s", datapath.id)
 
-        # Table-miss: send unmatched packets to controller
         self.flow_manager.add_flow(
             priority=0,
             actions=[{"type": "output", "port": ofproto.OFPP_CONTROLLER,
@@ -411,9 +590,18 @@ class UPFControllerApp(app_manager.RyuApp):
         )
         self.logger.info("[OVS] Installed table-miss flow")
 
+        # Re-push all flows from persisted sessions
+        flows = self.session_store.get_all_expected_flows()
+        if flows:
+            self.logger.info("[OVS] Restoring %d flows from session store", len(flows))
+            for flow in flows:
+                add_ovs_flow(flow, self.flow_manager)
+
+        # Trigger immediate reconciliation for GTP tunnels
+        self._reconciler.run_once()
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle packets sent to controller (table-miss). Flood by default."""
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -449,7 +637,6 @@ def _parse_request_json(req) -> dict:
 
 
 def _parse_session(data: dict) -> Session:
-    """Parse a session establish JSON payload into a Session object."""
     pdrs = []
     for p in data.get("pdrs", []):
         pdrs.append(PDR(
@@ -489,15 +676,14 @@ class UPFRestController(ControllerBase):
 
     @route("upf", "/session/establish", methods=["POST"])
     def session_establish(self, req, **kwargs):
-        """Session Establishment: save session, create tunnels and OVS flows."""
         try:
             data = _parse_request_json(req)
             logging.info("[API] Session establishment: %s", data)
 
             session = _parse_session(data)
             self.app.session_store.add_session(session)
-            logging.debug("[STATE] session count=%d",
-                          len(self.app.session_store.sessions_by_id))
+
+            errors = []
 
             tunnel = session.get_tunnel()
             if tunnel:
@@ -506,12 +692,22 @@ class UPFRestController(ControllerBase):
                         ue_ip=tunnel.ue_ip, teid=tunnel.teid,
                         remote_ip=tunnel.dest_ip,
                     )
-                    logging.debug("[GTP] establish add tunnel result=%s", gtp_resp)
+                    if gtp_resp.get("status") != "ok":
+                        errors.append("GTP tunnel add: %s" % gtp_resp)
                 except (OSError, ConnectionError, ValueError) as e:
+                    errors.append("GTP tunnel add: %s" % e)
                     logging.warning("[GTP] Tunnel add failed: %s", e)
+
+            if self.app.flow_manager is None:
+                errors.append("OVS not connected")
 
             for flow in session.get_flows():
                 add_ovs_flow(flow, self.app.flow_manager)
+
+            if errors:
+                return _json_response(
+                    {"status": "partial", "session_id": session.session_id,
+                     "errors": errors}, 503)
 
             return _json_response(
                 {"status": "success", "session_id": session.session_id})
@@ -523,7 +719,6 @@ class UPFRestController(ControllerBase):
 
     @route("upf", "/session/modify", methods=["PUT"])
     def session_modify(self, req, **kwargs):
-        """Session Modification: update PDR/FAR, modify tunnels/flows."""
         try:
             data = _parse_request_json(req)
             logging.info("[API] Session modification: %s", data)
@@ -537,7 +732,8 @@ class UPFRestController(ControllerBase):
             old_tunnel = session.get_tunnel()
             old_flows = {f.pdr_id: f for f in session.get_flows()}
 
-            # Apply PDR updates
+            errors = []
+
             for p in data.get("update_pdrs", []):
                 pdr_id = p["pdr_id"]
                 existing = next(
@@ -551,7 +747,6 @@ class UPFRestController(ControllerBase):
                     existing.outer_header_removal = p.get(
                         "outer_header_removal", existing.outer_header_removal)
 
-            # Apply FAR updates
             for f in data.get("update_fars", []):
                 far_id = f["far_id"]
                 ohc = None
@@ -569,38 +764,42 @@ class UPFRestController(ControllerBase):
                     if ohc:
                         session.fars[far_id].outer_header_creation = ohc
 
+            # Persist updated session
+            self.app.session_store.update_session(session)
+
             new_tunnel = session.get_tunnel()
             new_flows = {f.pdr_id: f for f in session.get_flows()}
 
-            # Tunnel changes
             try:
                 if old_tunnel and not new_tunnel:
-                    gtp_resp = _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
-                    logging.debug("[GTP] modify del tunnel result=%s", gtp_resp)
+                    _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
                 elif not old_tunnel and new_tunnel:
-                    gtp_resp = _gtp_client.add_tunnel(
+                    _gtp_client.add_tunnel(
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
-                    logging.debug("[GTP] modify add tunnel result=%s", gtp_resp)
                 elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
                     _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
                     _gtp_client.add_tunnel(
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
             except (OSError, ConnectionError, ValueError) as e:
+                errors.append("GTP tunnel modify: %s" % e)
                 logging.warning("[GTP] Tunnel modify failed: %s", e)
 
-            # Flow changes
             fm = self.app.flow_manager
             for pdr_id, flow in new_flows.items():
                 if pdr_id not in old_flows:
                     add_ovs_flow(flow, fm)
                 elif flow != old_flows[pdr_id]:
                     modify_ovs_flow(flow, fm)
-
             for pdr_id, flow in old_flows.items():
                 if pdr_id not in new_flows:
                     delete_ovs_flow(flow, fm)
+
+            if errors:
+                return _json_response(
+                    {"status": "partial", "session_id": session_id,
+                     "errors": errors}, 503)
 
             return _json_response(
                 {"status": "success", "session_id": session_id})
@@ -612,7 +811,6 @@ class UPFRestController(ControllerBase):
 
     @route("upf", "/session/delete", methods=["DELETE"])
     def session_delete(self, req, **kwargs):
-        """Session Deletion: delete flows, tunnels, and session data."""
         try:
             data = _parse_request_json(req)
             logging.info("[API] Session deletion: %s", data)
@@ -623,12 +821,14 @@ class UPFRestController(ControllerBase):
                 return _json_response(
                     {"status": "error", "message": "Session not found"}, 404)
 
+            errors = []
+
             tunnel = session.get_tunnel()
             if tunnel:
                 try:
-                    gtp_resp = _gtp_client.del_tunnel(ue_ip=tunnel.ue_ip)
-                    logging.debug("[GTP] delete tunnel result=%s", gtp_resp)
+                    _gtp_client.del_tunnel(ue_ip=tunnel.ue_ip)
                 except (OSError, ConnectionError, ValueError) as e:
+                    errors.append("GTP tunnel delete: %s" % e)
                     logging.warning("[GTP] Tunnel delete failed: %s", e)
 
             fm = self.app.flow_manager
@@ -636,8 +836,11 @@ class UPFRestController(ControllerBase):
                 delete_ovs_flow(flow, fm)
 
             self.app.session_store.remove_session(session_id)
-            logging.debug("[STATE] session count=%d",
-                          len(self.app.session_store.sessions_by_id))
+
+            if errors:
+                return _json_response(
+                    {"status": "partial", "session_id": session_id,
+                     "errors": errors}, 503)
 
             return _json_response(
                 {"status": "success", "session_id": session_id})

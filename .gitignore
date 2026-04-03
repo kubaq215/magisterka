@@ -1,5 +1,5 @@
-myupf/build
-myupf/install
+**/build
+**/install
 myupf/subprojects/freeDiameter/
 myupf/subprojects/libtins/
 myupf/subprojects/prometheus-client-c/

@@ -319,7 +319,8 @@ void upf_n4_handle_session_establishment_request(
                 xact, sess, created_pdr, num_of_created_pdr));
 
     if (upf_controller_notify_session_establish(sess) != OGS_OK) {
-        ogs_warn("Failed to notify UPF controller about session establishment");
+        ogs_error("Failed to notify UPF controller about session establishment "
+                  "(session will be reconciled on next cycle)");
     }
 
     return;
@@ -614,7 +615,8 @@ void upf_n4_handle_session_modification_request(
                 sess,
                 modified_pdr, num_of_modified_pdr,
                 modified_far, num_of_modified_far) != OGS_OK) {
-        ogs_warn("Failed to notify UPF controller about session modification");
+        ogs_error("Failed to notify UPF controller about session modification "
+                  "(session will be reconciled on next cycle)");
     }
 
     return;
@@ -654,7 +656,8 @@ void upf_n4_handle_session_deletion_request(
     ogs_info("----- Session[%d] - Deleted ------", sess->id);
 
     if (upf_controller_notify_session_delete(sess) != OGS_OK) {
-        ogs_warn("Failed to notify UPF controller about session deletion");
+        ogs_error("Failed to notify UPF controller about session deletion "
+                  "(session will be reconciled on next cycle)");
     }
 
     upf_sess_remove(sess);

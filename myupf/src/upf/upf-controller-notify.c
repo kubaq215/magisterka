@@ -249,8 +249,28 @@ static cJSON *build_far_json(const ogs_pfcp_far_t *far)
     return obj;
 }
 
-static int send_http_json_to_upf_controller(
-        const char *method, const char *path, const char *json)
+#define UPF_CONTROLLER_MAX_RETRIES 3
+static const int retry_delays_ms[] = { 0, 100, 500 };
+
+static int parse_http_status(const char *buf, size_t len)
+{
+    /* Minimal parse: "HTTP/1.x NNN ..." */
+    if (len < 12)
+        return -1;
+    if (strncmp(buf, "HTTP/1.", 7) != 0)
+        return -1;
+
+    const char *sp = memchr(buf + 8, ' ', len - 8);
+    if (!sp)
+        sp = buf + 8;
+    else
+        sp = buf + 9; /* skip "HTTP/1.x " */
+
+    return atoi(sp);
+}
+
+static int send_http_json_once(
+        const char *method, const char *path, const char *json_body)
 {
     int fd;
     struct sockaddr_in addr;
@@ -260,14 +280,11 @@ static int send_http_json_to_upf_controller(
     size_t req_len;
     size_t json_len;
     size_t alloc_size;
+    char response_buf[1024];
+    size_t resp_len = 0;
+    int http_status;
 
-    ogs_assert(method);
-    ogs_assert(path);
-    ogs_assert(json);
-
-    load_upf_controller_config_once();
-
-    json_len = strlen(json);
+    json_len = strlen(json_body);
     alloc_size = json_len + 1024;
     request = (char *)malloc(alloc_size);
     if (!request) {
@@ -282,7 +299,7 @@ static int send_http_json_to_upf_controller(
         return OGS_ERROR;
     }
 
-    timeout.tv_sec = 1;
+    timeout.tv_sec = 2;
     timeout.tv_usec = 0;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -313,7 +330,7 @@ static int send_http_json_to_upf_controller(
             "\r\n"
             "%s",
             method, path, upf_controller_host, upf_controller_port,
-            json_len, json);
+            json_len, json_body);
 
     if (req_len >= alloc_size) {
         ogs_warn("UPF controller request too large");
@@ -323,23 +340,64 @@ static int send_http_json_to_upf_controller(
     }
 
     sent = send(fd, request, req_len, 0);
+    free(request);
     if (sent < 0 || (size_t)sent != req_len) {
         ogs_warn("UPF controller send() failed: %s", strerror(errno));
         close(fd);
-        free(request);
         return OGS_ERROR;
     }
 
-    while (1) {
-        char response_buf[512];
-        ssize_t r = recv(fd, response_buf, sizeof(response_buf), 0);
+    /* Read response and check HTTP status */
+    while (resp_len < sizeof(response_buf) - 1) {
+        ssize_t r = recv(fd, response_buf + resp_len,
+                sizeof(response_buf) - 1 - resp_len, 0);
         if (r <= 0)
             break;
+        resp_len += (size_t)r;
+    }
+    response_buf[resp_len] = '\0';
+    close(fd);
+
+    http_status = parse_http_status(response_buf, resp_len);
+    if (http_status < 200 || http_status >= 300) {
+        ogs_warn("UPF controller returned HTTP %d for %s %s",
+                http_status, method, path);
+        return OGS_ERROR;
     }
 
-    close(fd);
-    free(request);
     return OGS_OK;
+}
+
+static int send_http_json_to_upf_controller(
+        const char *method, const char *path, const char *json_body)
+{
+    int rv;
+    int attempt;
+
+    ogs_assert(method);
+    ogs_assert(path);
+    ogs_assert(json_body);
+
+    load_upf_controller_config_once();
+
+    for (attempt = 0; attempt < UPF_CONTROLLER_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+            int delay_ms = retry_delays_ms[attempt];
+            ogs_warn("UPF controller retry %d/%d after %dms for %s %s",
+                    attempt + 1, UPF_CONTROLLER_MAX_RETRIES,
+                    delay_ms, method, path);
+            if (delay_ms > 0)
+                usleep((useconds_t)delay_ms * 1000);
+        }
+
+        rv = send_http_json_once(method, path, json_body);
+        if (rv == OGS_OK)
+            return OGS_OK;
+    }
+
+    ogs_error("UPF controller notification failed after %d attempts: %s %s",
+            UPF_CONTROLLER_MAX_RETRIES, method, path);
+    return OGS_ERROR;
 }
 
 int upf_controller_notify_session_establish(upf_sess_t *sess)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-gtp_tun_injector_dynamic.py
+gtp-endpoint.py
 
-- Data Plane: GTP-U <-> TUN
-- Control Plane: UDP/5555 (commands to map UE IPs to TEIDs)
+- Data Plane: GTP-U <-> TAP (Layer 2, for OVS)
+- Control Plane: TCP with JSON + HMAC-SHA256 authentication
 """
 
 import os
@@ -11,7 +11,9 @@ import fcntl
 import struct
 import subprocess
 import socket
-import time
+import hmac
+import hashlib
+import json
 import binascii
 import argparse
 import signal
@@ -28,14 +30,18 @@ IFF_NO_PI = 0x1000
 MAX_PKT   = 65535
 ETH_P_IP  = b'\x08\x00'
 ETH_P_IPV6 = b'\x86\xdd'
-# Known MACs — must match ovs-setup.sh (locally-administered unicast)
-ETH_DST   = b'\x02\x00\x00\x00\x00\x01'  # veth-ext's MAC
-ETH_SRC   = b'\x02\x00\x00\x00\x00\x02'  # gtp0's MAC
+ETH_DST   = b'\x02\x00\x00\x00\x00\x01'
+ETH_SRC   = b'\x02\x00\x00\x00\x00\x02'
+
+CTRL_RECV_BUF = 65535
 
 # Global State
 tun_fd_global = None
 tun_name_global = None
-ue_mapping = {}  # Format: { "UE_IP_STR": (TEID_INT, "REMOTE_IP_STR") }
+shared_secret = b""
+ue_mapping = {}  # { "UE_IP_STR": (TEID_INT, "REMOTE_IP_STR") }
+ctrl_clients = []  # list of connected TCP client sockets
+ctrl_buffers = {}  # sock -> bytes (partial read buffer)
 
 
 # -----------------------
@@ -96,63 +102,118 @@ def hexdump(b, length=64):
     return " ".join(s[i:i+2] for i in range(0, min(len(s), length*2), 2))
 
 # -----------------------
+# HMAC helpers
+# -----------------------
+
+def compute_sig(msg_body: dict, secret: bytes) -> str:
+    payload = json.dumps(msg_body, sort_keys=True, separators=(",", ":"))
+    return hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+
+def verify_sig(msg: dict, secret: bytes) -> bool:
+    sig = msg.get("sig", "")
+    body = {k: v for k, v in msg.items() if k != "sig"}
+    expected = compute_sig(body, secret)
+    return hmac.compare_digest(sig, expected)
+
+def sign_response(body: dict, secret: bytes) -> dict:
+    body["sig"] = compute_sig(body, secret)
+    return body
+
+# -----------------------
+# TCP Control Helpers
+# -----------------------
+
+def send_json_line(sock, obj):
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    try:
+        sock.sendall(line.encode())
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        remove_ctrl_client(sock)
+
+def remove_ctrl_client(sock):
+    if sock in ctrl_clients:
+        ctrl_clients.remove(sock)
+    ctrl_buffers.pop(sock, None)
+    try:
+        sock.close()
+    except OSError:
+        pass
+    print("[CTRL] Client disconnected")
+
+# -----------------------
 # Protocol Handlers
 # -----------------------
 
-def handle_control_msg(sock):
-    """
-    Reads commands from the control socket.
-    Format: ADD <UE_IP> <TEID> <REMOTE_IP>
-            DEL <UE_IP>
-            LIST
-    """
+def handle_ctrl_accept(listen_sock):
+    conn, addr = listen_sock.accept()
+    conn.setblocking(False)
+    ctrl_clients.append(conn)
+    ctrl_buffers[conn] = b""
+    print(f"[CTRL] Client connected from {addr[0]}:{addr[1]}")
+
+def handle_ctrl_data(sock):
     try:
-        data, addr = sock.recvfrom(4096)
-        msg = data.decode('utf-8').strip()
-    except Exception:
+        data = sock.recv(CTRL_RECV_BUF)
+    except (ConnectionResetError, OSError):
+        data = b""
+
+    if not data:
+        remove_ctrl_client(sock)
         return
 
-    parts = msg.split()
-    if not parts:
+    ctrl_buffers[sock] = ctrl_buffers.get(sock, b"") + data
+
+    while b"\n" in ctrl_buffers[sock]:
+        line, ctrl_buffers[sock] = ctrl_buffers[sock].split(b"\n", 1)
+        process_ctrl_line(sock, line)
+
+def process_ctrl_line(sock, line_bytes):
+    try:
+        msg = json.loads(line_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        send_json_line(sock, {"status": "error", "message": "invalid JSON"})
         return
 
-    cmd = parts[0].upper()
-    response = "OK\n"
+    if shared_secret and not verify_sig(msg, shared_secret):
+        send_json_line(sock, {"status": "error", "message": "bad signature"})
+        return
+
+    cmd = msg.get("cmd", "").upper()
+    resp = {"status": "ok"}
 
     try:
         if cmd == "ADD":
-            # ADD 10.45.0.2 200 192.168.1.50
-            if len(parts) < 4:
-                response = "ERROR: Usage: ADD <UE_IP> <TEID> <REMOTE_IP>\n"
-            else:
-                ue_ip, teid, remote_ip = parts[1], int(parts[2]), parts[3]
-                ue_mapping[ue_ip] = (teid, remote_ip)
-                print(f"[CTRL] Added mapping: {ue_ip} -> TEID {teid} @ {remote_ip}")
+            ue_ip = msg["ue_ip"]
+            teid = int(msg["teid"])
+            remote_ip = msg["remote_ip"]
+            ue_mapping[ue_ip] = (teid, remote_ip)
+            resp["ue_ip"] = ue_ip
+            print(f"[CTRL] Added mapping: {ue_ip} -> TEID {teid} @ {remote_ip}")
 
         elif cmd == "DEL":
-            if len(parts) < 2:
-                response = "ERROR: Usage: DEL <UE_IP>\n"
+            ue_ip = msg["ue_ip"]
+            if ue_ip in ue_mapping:
+                del ue_mapping[ue_ip]
+                resp["ue_ip"] = ue_ip
+                print(f"[CTRL] Removed mapping for {ue_ip}")
             else:
-                ue_ip = parts[1]
-                if ue_ip in ue_mapping:
-                    del ue_mapping[ue_ip]
-                    print(f"[CTRL] Removed mapping for {ue_ip}")
-                else:
-                    response = "ERROR: IP not found\n"
+                resp = {"status": "error", "message": "IP not found"}
 
-        elif cmd == "LIST":
-            response = "--- Active Mappings ---\n"
+        elif cmd == "SYNC":
+            mappings = []
             for ip, (teid, remote) in ue_mapping.items():
-                response += f"{ip} -> TEID: {teid}, GW: {remote}\n"
-            response += "-----------------------\n"
-        
-        else:
-            response = "ERROR: Unknown command\n"
-    
-    except ValueError:
-        response = "ERROR: Invalid format (TEID must be int)\n"
+                mappings.append({"ue_ip": ip, "teid": teid, "remote_ip": remote})
+            resp["mappings"] = mappings
 
-    sock.sendto(response.encode(), addr)
+        else:
+            resp = {"status": "error", "message": f"unknown command: {cmd}"}
+
+    except (KeyError, ValueError) as e:
+        resp = {"status": "error", "message": str(e)}
+
+    if shared_secret:
+        resp = sign_response(resp, shared_secret)
+    send_json_line(sock, resp)
 
 
 def handle_rx_gtp(sock, tun_fd, args):
@@ -235,11 +296,10 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind-ip", default="0.0.0.0", help="GTP-U Listen IP")
-    parser.add_argument("--control-ip", default="127.0.0.1", help="Control Socket IP")
-    parser.add_argument("--control-port", type=int, default=5555, help="Control Socket Port")
+    parser.add_argument("--control-ip", default="0.0.0.0", help="Control TCP listen IP")
+    parser.add_argument("--control-port", type=int, default=5555, help="Control TCP listen port")
+    parser.add_argument("--secret", default="", help="Shared HMAC-SHA256 secret (empty = no auth)")
     parser.add_argument("--tun-name", default="gtp0")
-    
-    # Optional defaults if mapping is missed
     parser.add_argument("--default-remote-ip", help="Default Remote GTP Peer")
     parser.add_argument("--default-teid", type=int, help="Default TX TEID")
     parser.add_argument("--teid", type=int, help="RX Filter TEID (incoming)")
@@ -247,9 +307,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Signals
+    global shared_secret
+
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+    if args.secret:
+        shared_secret = args.secret.encode()
+        print("[+] HMAC-SHA256 authentication enabled")
 
     # 1. Setup TAP
     tun_fd, tun_name = create_tap(args.tun_name)
@@ -262,22 +327,25 @@ def main():
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data_sock.bind((args.bind_ip, 2152))
 
-    # 3. Setup Control Socket
-    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ctrl_sock.bind((args.control_ip, args.control_port))
-    print(f"[+] Control Socket listening on {args.control_ip}:{args.control_port}")
-    print(f"    Use: echo 'ADD <UE_IP> <TEID> <GW_IP>' | nc -u {args.control_ip} {args.control_port}")
+    # 3. Setup TCP Control Socket
+    ctrl_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ctrl_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ctrl_listen.setblocking(False)
+    ctrl_listen.bind((args.control_ip, args.control_port))
+    ctrl_listen.listen(4)
+    print(f"[+] Control TCP listening on {args.control_ip}:{args.control_port}")
 
     # 4. Event Loop
-    inputs = [data_sock, ctrl_sock, tun_fd]
-
     try:
         while True:
-            readable, _, _ = select.select(inputs, [], [])
+            inputs = [data_sock, ctrl_listen, tun_fd] + ctrl_clients
+            readable, _, _ = select.select(inputs, [], [], 1.0)
 
             for r in readable:
-                if r is ctrl_sock:
-                    handle_control_msg(ctrl_sock)
+                if r is ctrl_listen:
+                    handle_ctrl_accept(ctrl_listen)
+                elif r in ctrl_clients:
+                    handle_ctrl_data(r)
                 elif r is data_sock:
                     handle_rx_gtp(data_sock, tun_fd, args)
                 elif r is tun_fd:
@@ -286,6 +354,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        for c in list(ctrl_clients):
+            remove_ctrl_client(c)
+        ctrl_listen.close()
         cleanup_and_exit(None, None)
 
 if __name__ == "__main__":

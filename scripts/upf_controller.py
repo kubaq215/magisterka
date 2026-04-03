@@ -4,7 +4,8 @@ upf_controller.py  –  Ryu-based UPF Control Plane
 
 1. Receives JSON Session info from Open5GS (C-Code) via REST (Ryu WSGI).
 2. Programs OVS flows on br0 via OpenFlow 1.3 using FlowManager.
-3. Sends simplified "ADD/DEL" commands to the Dataplane script via UDP.
+3. Manages GTP tunnel mappings on the dataplane via a persistent
+   TCP connection with JSON + HMAC-SHA256 authentication.
 
 Usage:
   ryu-manager upf_controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
@@ -14,10 +15,13 @@ Usage:
 """
 
 import configparser
+import hashlib
+import hmac as hmac_mod
 import json
 import logging
 import os
 import socket
+import threading
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 
@@ -42,6 +46,7 @@ def _load_config(path: str = None) -> configparser.ConfigParser:
         "gtp": {
             "endpoint_ip":   "127.0.0.1",
             "endpoint_port": "5555",
+            "secret":        "",
         },
         "controller": {
             "ip":   "127.0.0.1",
@@ -61,6 +66,7 @@ _cfg = _load_config()
 
 GTP_ENDPOINT_IP   = _cfg.get("gtp", "endpoint_ip")
 GTP_ENDPOINT_PORT = _cfg.getint("gtp", "endpoint_port")
+GTP_SECRET        = _cfg.get("gtp", "secret").encode() or b""
 CONTROLLER_IP     = _cfg.get("controller", "ip")
 CONTROLLER_PORT   = _cfg.getint("controller", "port")
 
@@ -172,47 +178,118 @@ class SessionStore:
         ids = self.sessions_by_ue_ip.get(ue_ip, set())
         return [self.sessions_by_id[i] for i in ids]
 
-# --- Helpers ---
+# ---------------------------------------------------------------------------
+# Persistent TCP client for GTP endpoint communication (JSON + HMAC)
+# ---------------------------------------------------------------------------
 
-def gtp_add_tunnel(
-    ue_ip: str,
-    teid: int,
-    remote_ip: str,
-    timeout: float = 1.0,
-):
-    msg = f"ADD {ue_ip} {teid} {remote_ip}\n"
-    logging.debug(f"[GTP] -> endpoint send: {msg.strip()}")
+class GtpEndpointClient:
+    """Thread-safe persistent TCP connection to gtp-endpoint.py."""
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
+    def __init__(self, host: str, port: int, secret: bytes,
+                 timeout: float = 2.0):
+        self._host = host
+        self._port = port
+        self._secret = secret
+        self._timeout = timeout
+        self._sock: Optional[socket.socket] = None
+        self._lock = threading.Lock()
+        self._buf = b""
 
-    try:
-        sock.sendto(msg.encode(), (GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT))
-        resp, _ = sock.recvfrom(4096)
-        decoded = resp.decode().strip()
-        logging.debug(f"[GTP] <- endpoint resp: {decoded}")
-        return decoded
-    finally:
-        sock.close()
+    def _compute_sig(self, body: dict) -> str:
+        payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        return hmac_mod.new(
+            self._secret, payload.encode(), hashlib.sha256
+        ).hexdigest()
 
-def gtp_del_tunnel(
-    ue_ip: str,
-    timeout: float = 1.0,
-):
-    msg = f"DEL {ue_ip}\n"
-    logging.debug(f"[GTP] -> endpoint send: {msg.strip()}")
+    def _verify_sig(self, msg: dict) -> bool:
+        if not self._secret:
+            return True
+        sig = msg.get("sig", "")
+        body = {k: v for k, v in msg.items() if k != "sig"}
+        expected = self._compute_sig(body)
+        return hmac_mod.compare_digest(sig, expected)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
+    def _connect(self):
+        if self._sock is not None:
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self._timeout)
+        sock.connect((self._host, self._port))
+        self._sock = sock
+        self._buf = b""
+        logging.info("[GTP] TCP connected to %s:%d", self._host, self._port)
 
-    try:
-        sock.sendto(msg.encode(), (GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT))
-        resp, _ = sock.recvfrom(4096)
-        decoded = resp.decode().strip()
-        logging.debug(f"[GTP] <- endpoint resp: {decoded}")
-        return decoded
-    finally:
-        sock.close()
+    def _close(self):
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+            self._buf = b""
+
+    def _send_and_recv(self, msg: dict) -> dict:
+        if self._secret:
+            msg["sig"] = self._compute_sig(msg)
+
+        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        self._sock.sendall(line.encode())
+
+        while b"\n" not in self._buf:
+            chunk = self._sock.recv(65535)
+            if not chunk:
+                raise ConnectionError("GTP endpoint closed connection")
+            self._buf += chunk
+
+        resp_line, self._buf = self._buf.split(b"\n", 1)
+        resp = json.loads(resp_line.decode("utf-8"))
+
+        if not self._verify_sig(resp):
+            raise ValueError("GTP endpoint response has bad signature")
+
+        return resp
+
+    def _request(self, msg: dict) -> dict:
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    self._connect()
+                    return self._send_and_recv(msg)
+                except (OSError, ConnectionError, ValueError) as e:
+                    logging.warning("[GTP] Request failed (attempt %d): %s",
+                                    attempt + 1, e)
+                    self._close()
+                    if attempt == 1:
+                        raise
+
+    def add_tunnel(self, ue_ip: str, teid: int, remote_ip: str) -> dict:
+        msg = {"cmd": "ADD", "ue_ip": ue_ip,
+               "teid": teid, "remote_ip": remote_ip}
+        logging.debug("[GTP] -> ADD %s teid=%d remote=%s",
+                      ue_ip, teid, remote_ip)
+        resp = self._request(msg)
+        logging.debug("[GTP] <- %s", resp)
+        return resp
+
+    def del_tunnel(self, ue_ip: str) -> dict:
+        msg = {"cmd": "DEL", "ue_ip": ue_ip}
+        logging.debug("[GTP] -> DEL %s", ue_ip)
+        resp = self._request(msg)
+        logging.debug("[GTP] <- %s", resp)
+        return resp
+
+    def sync(self) -> dict:
+        msg = {"cmd": "SYNC"}
+        logging.debug("[GTP] -> SYNC")
+        resp = self._request(msg)
+        logging.debug("[GTP] <- SYNC: %d mappings",
+                      len(resp.get("mappings", [])))
+        return resp
+
+
+_gtp_client = GtpEndpointClient(
+    GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT, GTP_SECRET
+)
 
 # --- OVS Flow Management (OpenFlow via FlowManager) ---
 
@@ -425,13 +502,13 @@ class UPFRestController(ControllerBase):
             tunnel = session.get_tunnel()
             if tunnel:
                 try:
-                    gtp_resp = gtp_add_tunnel(
+                    gtp_resp = _gtp_client.add_tunnel(
                         ue_ip=tunnel.ue_ip, teid=tunnel.teid,
                         remote_ip=tunnel.dest_ip,
                     )
                     logging.debug("[GTP] establish add tunnel result=%s", gtp_resp)
-                except socket.timeout:
-                    logging.warning("[GTP] Tunnel add timed out (gtp-endpoint not running?)")
+                except (OSError, ConnectionError, ValueError) as e:
+                    logging.warning("[GTP] Tunnel add failed: %s", e)
 
             for flow in session.get_flows():
                 add_ovs_flow(flow, self.app.flow_manager)
@@ -498,20 +575,20 @@ class UPFRestController(ControllerBase):
             # Tunnel changes
             try:
                 if old_tunnel and not new_tunnel:
-                    gtp_resp = gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
+                    gtp_resp = _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
                     logging.debug("[GTP] modify del tunnel result=%s", gtp_resp)
                 elif not old_tunnel and new_tunnel:
-                    gtp_resp = gtp_add_tunnel(
+                    gtp_resp = _gtp_client.add_tunnel(
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
                     logging.debug("[GTP] modify add tunnel result=%s", gtp_resp)
                 elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
-                    gtp_del_tunnel(ue_ip=old_tunnel.ue_ip)
-                    gtp_add_tunnel(
+                    _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
+                    _gtp_client.add_tunnel(
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
-            except socket.timeout:
-                logging.warning("[GTP] Tunnel modify timed out (gtp-endpoint not running?)")
+            except (OSError, ConnectionError, ValueError) as e:
+                logging.warning("[GTP] Tunnel modify failed: %s", e)
 
             # Flow changes
             fm = self.app.flow_manager
@@ -549,10 +626,10 @@ class UPFRestController(ControllerBase):
             tunnel = session.get_tunnel()
             if tunnel:
                 try:
-                    gtp_resp = gtp_del_tunnel(ue_ip=tunnel.ue_ip)
+                    gtp_resp = _gtp_client.del_tunnel(ue_ip=tunnel.ue_ip)
                     logging.debug("[GTP] delete tunnel result=%s", gtp_resp)
-                except socket.timeout:
-                    logging.warning("[GTP] Tunnel delete timed out (gtp-endpoint not running?)")
+                except (OSError, ConnectionError, ValueError) as e:
+                    logging.warning("[GTP] Tunnel delete failed: %s", e)
 
             fm = self.app.flow_manager
             for flow in session.get_flows():

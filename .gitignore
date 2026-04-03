@@ -7,3 +7,4 @@ myupf/subprojects/usrsctp/
 pcaps/*
 notatki/*
 chapters/*
+**/__pycache__/*

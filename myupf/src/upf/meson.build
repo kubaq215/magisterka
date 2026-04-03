@@ -66,6 +66,7 @@ libupf_sources = files('''
     n4-build.c
     n4-handler.c
     upf-controller-notify.c
+    cJSON.c
 '''.split())
 
 libupf = static_library('upf',

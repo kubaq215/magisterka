@@ -308,6 +308,10 @@ void upf_n4_handle_session_establishment_request(
         }
     }
 
+    if (upf_controller_notify_session_establish(sess) != OGS_OK) {
+        ogs_error("Failed to notify UPF controller about session establishment");
+    }
+
     if (restoration_indication == true ||
         ogs_pfcp_self()->up_function_features.ftup == 0)
         ogs_assert(OGS_OK ==
@@ -317,11 +321,6 @@ void upf_n4_handle_session_establishment_request(
         ogs_assert(OGS_OK ==
             upf_pfcp_send_session_establishment_response(
                 xact, sess, created_pdr, num_of_created_pdr));
-
-    if (upf_controller_notify_session_establish(sess) != OGS_OK) {
-        ogs_error("Failed to notify UPF controller about session establishment "
-                  "(session will be reconciled on next cycle)");
-    }
 
     return;
 
@@ -602,6 +601,13 @@ void upf_n4_handle_session_modification_request(
         }
     }
 
+    if (upf_controller_notify_session_modify(
+                sess,
+                modified_pdr, num_of_modified_pdr,
+                modified_far, num_of_modified_far) != OGS_OK) {
+        ogs_error("Failed to notify UPF controller about session modification");
+    }
+
     if (ogs_pfcp_self()->up_function_features.ftup == 0)
         ogs_assert(OGS_OK ==
             upf_pfcp_send_session_modification_response(
@@ -610,14 +616,6 @@ void upf_n4_handle_session_modification_request(
         ogs_assert(OGS_OK ==
             upf_pfcp_send_session_modification_response(
                 xact, sess, created_pdr, num_of_created_pdr));
-
-    if (upf_controller_notify_session_modify(
-                sess,
-                modified_pdr, num_of_modified_pdr,
-                modified_far, num_of_modified_far) != OGS_OK) {
-        ogs_error("Failed to notify UPF controller about session modification "
-                  "(session will be reconciled on next cycle)");
-    }
 
     return;
 
@@ -646,8 +644,6 @@ void upf_n4_handle_session_deletion_request(
                 OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
         return;
     }
-    upf_pfcp_send_session_deletion_response(xact, sess);
-
     // ogs_list_for_each(&sess->pfcp.qer_list, qer) {
     //     upf_metrics_inst_by_dnn_add(sess->apn_dnn,
     //             UPF_METR_GAUGE_UPF_QOSFLOWS, -1);
@@ -656,9 +652,10 @@ void upf_n4_handle_session_deletion_request(
     ogs_info("----- Session[%d] - Deleted ------", sess->id);
 
     if (upf_controller_notify_session_delete(sess) != OGS_OK) {
-        ogs_error("Failed to notify UPF controller about session deletion "
-                  "(session will be reconciled on next cycle)");
+        ogs_error("Failed to notify UPF controller about session deletion");
     }
+
+    upf_pfcp_send_session_deletion_response(xact, sess);
 
     upf_sess_remove(sess);
 }

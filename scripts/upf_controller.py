@@ -79,6 +79,16 @@ CONTROLLER_PORT   = _cfg.getint("controller", "port")
 OVS_PORT_ACCESS = _cfg.getint("ovs", "port_access")
 OVS_PORT_CORE   = _cfg.getint("ovs", "port_core")
 
+# OpenFlow max priority (2^16 - 1); used to invert PFCP precedence semantics.
+# In 3GPP TS 29.244, lower precedence = higher priority;
+# in OpenFlow 1.3, higher priority = higher priority.
+MAX_PRIORITY = 65535
+
+
+def _precedence_to_priority(precedence: int) -> int:
+    """Convert PFCP PDR precedence to OpenFlow priority (inverted scale)."""
+    return max(0, min(MAX_PRIORITY, MAX_PRIORITY - precedence))
+
 _SESSION_FILE_DEFAULT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sessions.json")
 SESSION_FILE = _cfg.get("persistence", "session_file") or _SESSION_FILE_DEFAULT
@@ -370,6 +380,15 @@ class GtpEndpointClient:
         logging.debug("[GTP] <- %s", resp)
         return resp
 
+    def modify_tunnel(self, ue_ip: str, teid: int, remote_ip: str) -> dict:
+        msg = {"cmd": "MODIFY", "ue_ip": ue_ip,
+               "teid": teid, "remote_ip": remote_ip}
+        logging.debug("[GTP] -> MODIFY %s teid=%d remote=%s",
+                      ue_ip, teid, remote_ip)
+        resp = self._request(msg)
+        logging.debug("[GTP] <- %s", resp)
+        return resp
+
     def sync(self) -> dict:
         msg = {"cmd": "SYNC"}
         logging.debug("[GTP] -> SYNC")
@@ -519,7 +538,7 @@ def add_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
         logging.warning("[OVS] No switch connected – flow not installed")
         return
     flow_manager.add_flow(
-        priority=flow.precedence,
+        priority=_precedence_to_priority(flow.precedence),
         match_fields=_flow_match_fields(flow),
         actions=_flow_actions(flow),
     )
@@ -532,7 +551,7 @@ def delete_ovs_flow(flow: Flow, flow_manager: Optional[FlowManager]):
         return
     flow_manager.delete_flow(
         match_fields=_flow_match_fields(flow),
-        priority=flow.precedence,
+        priority=_precedence_to_priority(flow.precedence),
     )
 
 
@@ -778,8 +797,7 @@ class UPFRestController(ControllerBase):
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
                 elif old_tunnel and new_tunnel and old_tunnel != new_tunnel:
-                    _gtp_client.del_tunnel(ue_ip=old_tunnel.ue_ip)
-                    _gtp_client.add_tunnel(
+                    _gtp_client.modify_tunnel(
                         ue_ip=new_tunnel.ue_ip, teid=new_tunnel.teid,
                         remote_ip=new_tunnel.dest_ip)
             except (OSError, ConnectionError, ValueError) as e:

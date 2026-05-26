@@ -197,6 +197,15 @@ def process_ctrl_line(sock, line_bytes):
             else:
                 resp = {"status": "error", "message": "IP not found"}
 
+        elif cmd == "MODIFY":
+            ue_ip = msg["ue_ip"]
+            teid = int(msg["teid"])
+            remote_ip = msg["remote_ip"]
+            ue_mapping[ue_ip] = (teid, remote_ip)
+            ue_mapping_fast[socket.inet_aton(ue_ip)] = (teid, remote_ip)
+            resp["ue_ip"] = ue_ip
+            print(f"[CTRL] Modified mapping: {ue_ip} -> TEID {teid} @ {remote_ip}")
+
         elif cmd == "SYNC":
             mappings = []
             for ip, (teid, remote) in ue_mapping.items():

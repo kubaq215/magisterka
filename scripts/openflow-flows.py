@@ -4,10 +4,10 @@ OpenFlow 1.3 flow manager using Ryu – importable module with add/delete API.
 Can be used in two ways:
 
   1. As a standalone Ryu app:
-       ryu-manager openflow_flows.py
+       ryu-manager openflow-flows.py
 
   2. Imported from another Ryu app:
-       from openflow_flows import FlowManager
+       from openflow-flows import FlowManager
 
        # In your RyuApp, after obtaining a datapath:
        fm = FlowManager(datapath)
@@ -158,7 +158,7 @@ class FlowManager:
 class FlowInstallerApp(app_manager.RyuApp):
     """Ryu app that installs example flows on switch connect.
 
-    Run directly:  ryu-manager openflow_flows.py
+    Run directly:  ryu-manager openflow-flows.py
     """
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 

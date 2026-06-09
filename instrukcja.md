@@ -149,7 +149,7 @@ In a new terminal:
 
 ```bash
 cd magisterka
-vi upf_controller.ini
+vi upf-controller.ini
 ```
 
 ```ini
@@ -194,7 +194,7 @@ else:
 ### 9. Start the SDN Controller
 
 ```bash
-ryu-manager upf_controller.py
+ryu-manager upf-controller.py
 ```
 
 ---

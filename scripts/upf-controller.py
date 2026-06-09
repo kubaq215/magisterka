@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-upf_controller.py  –  Ryu-based UPF Control Plane
+upf-controller.py  –  Ryu-based UPF Control Plane
 
 1. Receives JSON Session info from Open5GS (C-Code) via REST (Ryu WSGI).
 2. Programs OVS flows on br0 via OpenFlow 1.3 using FlowManager.
@@ -10,7 +10,7 @@ upf_controller.py  –  Ryu-based UPF Control Plane
    the GTP endpoint via the SYNC command.
 
 Usage:
-  ryu-manager upf_controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
+  ryu-manager upf-controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
 
   Then point OVS at this controller:
     ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
@@ -35,12 +35,20 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.app.wsgi import ControllerBase, WSGIApplication, route
 from webob import Response
 
-from openflow_flows import FlowManager
+import importlib.util as _ilu, os as _os
+_spec = _ilu.spec_from_file_location(
+    "openflow_flows",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "openflow-flows.py"),
+)
+_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+FlowManager = _mod.FlowManager
+del _ilu, _os, _spec, _mod
 
 # ---------------------------------------------------------------------------
-# Configuration – loaded from upf_controller.ini (or path in UPF_CONFIG env var)
+# Configuration – loaded from upf-controller.ini (or path in UPF_CONFIG env var)
 # ---------------------------------------------------------------------------
-_CONFIG_FILE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upf_controller.ini")
+_CONFIG_FILE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upf-controller.ini")
 
 def _load_config(path: str = None) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
@@ -94,7 +102,7 @@ _SESSION_FILE_DEFAULT = os.path.join(
 SESSION_FILE = _cfg.get("persistence", "session_file") or _SESSION_FILE_DEFAULT
 RECONCILE_INTERVAL = _cfg.getint("persistence", "reconcile_interval")
 
-upf_app_name = "upf_controller_app"
+upf_app_name = "upf-controller_app"
 
 # --- Class Definitions ---
 

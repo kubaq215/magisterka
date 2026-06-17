@@ -3,7 +3,7 @@
 gtp-endpoint.py
 
 - Data Plane: GTP-U <-> TAP (Layer 2, for OVS)
-- Control Plane: TCP with JSON + HMAC-SHA256 authentication
+- Control Plane: TCP with JSON
 
 Performance notes:
 - Manual GTP-U header parsing via struct (no Scapy)
@@ -19,8 +19,6 @@ import fcntl
 import struct
 import subprocess
 import socket
-import hmac
-import hashlib
 import json
 import binascii
 import argparse
@@ -52,7 +50,6 @@ CTRL_RECV_BUF = 65535
 # Global State
 tun_fd_global = None
 tun_name_global = None
-shared_secret = b""
 ue_mapping = {}       # { "UE_IP_STR": (TEID_INT, "REMOTE_IP_STR") }
 ue_mapping_fast = {}  # { 4-byte-raw-ip: (TEID_INT, "REMOTE_IP_STR") }
 ctrl_clients = []     # list of connected TCP client sockets
@@ -87,25 +84,6 @@ def hexdump(b, length=64):
     if not b: return ""
     s = binascii.hexlify(b).decode()
     return " ".join(s[i:i+2] for i in range(0, min(len(s), length*2), 2))
-
-
-# -----------------------
-# HMAC helpers
-# -----------------------
-
-def compute_sig(msg_body: dict, secret: bytes) -> str:
-    payload = json.dumps(msg_body, sort_keys=True, separators=(",", ":"))
-    return hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
-
-def verify_sig(msg: dict, secret: bytes) -> bool:
-    sig = msg.get("sig", "")
-    body = {k: v for k, v in msg.items() if k != "sig"}
-    expected = compute_sig(body, secret)
-    return hmac.compare_digest(sig, expected)
-
-def sign_response(body: dict, secret: bytes) -> dict:
-    body["sig"] = compute_sig(body, secret)
-    return body
 
 
 # -----------------------
@@ -170,10 +148,6 @@ def process_ctrl_line(sock, line_bytes):
         send_json_line(sock, {"status": "error", "message": "invalid JSON"})
         return
 
-    if shared_secret and not verify_sig(msg, shared_secret):
-        send_json_line(sock, {"status": "error", "message": "bad signature"})
-        return
-
     cmd = msg.get("cmd", "").upper()
     resp = {"status": "ok"}
 
@@ -218,8 +192,6 @@ def process_ctrl_line(sock, line_bytes):
     except (KeyError, ValueError) as e:
         resp = {"status": "error", "message": str(e)}
 
-    if shared_secret:
-        resp = sign_response(resp, shared_secret)
     send_json_line(sock, resp)
 
 
@@ -325,13 +297,12 @@ def handle_tx_tun(tun_fd, data_sock, default_gw, default_teid, verbose):
 # -----------------------
 
 def main():
-    global tun_fd_global, tun_name_global, shared_secret, sel
+    global tun_fd_global, tun_name_global, sel
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind-ip", default="0.0.0.0", help="GTP-U Listen IP")
     parser.add_argument("--control-ip", default="0.0.0.0", help="Control TCP listen IP")
     parser.add_argument("--control-port", type=int, default=5555, help="Control TCP listen port")
-    parser.add_argument("--secret", default="", help="Shared HMAC-SHA256 secret (empty = no auth)")
     parser.add_argument("--tun-name", default="gtp0")
     parser.add_argument("--default-remote-ip", help="Default Remote GTP Peer")
     parser.add_argument("--default-teid", type=int, help="Default TX TEID")
@@ -342,10 +313,6 @@ def main():
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
-
-    if args.secret:
-        shared_secret = args.secret.encode()
-        print("[+] HMAC-SHA256 authentication enabled")
 
     # 1. Setup TAP (O_NONBLOCK for batch drain)
     tun_fd, tun_name = create_tap(args.tun_name)

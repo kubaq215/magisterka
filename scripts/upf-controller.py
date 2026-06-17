@@ -5,7 +5,7 @@ upf-controller.py  –  Ryu-based UPF Control Plane
 1. Receives JSON Session info from Open5GS (C-Code) via REST (Ryu WSGI).
 2. Programs OVS flows on br0 via OpenFlow 1.3 using FlowManager.
 3. Manages GTP tunnel mappings on the dataplane via a persistent
-   TCP connection with JSON + HMAC-SHA256 authentication.
+   TCP connection with JSON.
 4. Persists sessions to disk and periodically reconciles state with
    the GTP endpoint via the SYNC command.
 
@@ -17,8 +17,6 @@ Usage:
 """
 
 import configparser
-import hashlib
-import hmac as hmac_mod
 import json
 import logging
 import os
@@ -56,7 +54,6 @@ def _load_config(path: str = None) -> configparser.ConfigParser:
         "gtp": {
             "endpoint_ip":   "127.0.0.1",
             "endpoint_port": "5555",
-            "secret":        "",
         },
         "controller": {
             "ip":   "127.0.0.1",
@@ -80,7 +77,6 @@ _cfg = _load_config()
 
 GTP_ENDPOINT_IP   = _cfg.get("gtp", "endpoint_ip")
 GTP_ENDPOINT_PORT = _cfg.getint("gtp", "endpoint_port")
-GTP_SECRET        = _cfg.get("gtp", "secret").encode() or b""
 CONTROLLER_IP     = _cfg.get("controller", "ip")
 CONTROLLER_PORT   = _cfg.getint("controller", "port")
 
@@ -289,35 +285,20 @@ class SessionStore:
             return 0
 
 # ---------------------------------------------------------------------------
-# Persistent TCP client for GTP endpoint communication (JSON + HMAC)
+# Persistent TCP client for GTP endpoint communication (JSON)
 # ---------------------------------------------------------------------------
 
 class GtpEndpointClient:
     """Thread-safe persistent TCP connection to gtp-endpoint.py."""
 
-    def __init__(self, host: str, port: int, secret: bytes,
+    def __init__(self, host: str, port: int,
                  timeout: float = 2.0):
         self._host = host
         self._port = port
-        self._secret = secret
         self._timeout = timeout
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
         self._buf = b""
-
-    def _compute_sig(self, body: dict) -> str:
-        payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
-        return hmac_mod.new(
-            self._secret, payload.encode(), hashlib.sha256
-        ).hexdigest()
-
-    def _verify_sig(self, msg: dict) -> bool:
-        if not self._secret:
-            return True
-        sig = msg.get("sig", "")
-        body = {k: v for k, v in msg.items() if k != "sig"}
-        expected = self._compute_sig(body)
-        return hmac_mod.compare_digest(sig, expected)
 
     def _connect(self):
         if self._sock is not None:
@@ -339,9 +320,6 @@ class GtpEndpointClient:
             self._buf = b""
 
     def _send_and_recv(self, msg: dict) -> dict:
-        if self._secret:
-            msg["sig"] = self._compute_sig(msg)
-
         line = json.dumps(msg, separators=(",", ":")) + "\n"
         self._sock.sendall(line.encode())
 
@@ -353,9 +331,6 @@ class GtpEndpointClient:
 
         resp_line, self._buf = self._buf.split(b"\n", 1)
         resp = json.loads(resp_line.decode("utf-8"))
-
-        if not self._verify_sig(resp):
-            raise ValueError("GTP endpoint response has bad signature")
 
         return resp
 
@@ -407,7 +382,7 @@ class GtpEndpointClient:
 
 
 _gtp_client = GtpEndpointClient(
-    GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT, GTP_SECRET
+    GTP_ENDPOINT_IP, GTP_ENDPOINT_PORT
 )
 
 # ---------------------------------------------------------------------------

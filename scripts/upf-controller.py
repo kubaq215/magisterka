@@ -350,26 +350,26 @@ class GtpEndpointClient:
     def add_tunnel(self, ue_ip: str, teid: int, remote_ip: str) -> dict:
         msg = {"cmd": "ADD", "ue_ip": ue_ip,
                "teid": teid, "remote_ip": remote_ip}
-        logging.debug("[GTP] -> ADD %s teid=%d remote=%s",
+        logging.info("[GTP] -> ADD %s teid=%d remote=%s",
                       ue_ip, teid, remote_ip)
         resp = self._request(msg)
-        logging.debug("[GTP] <- %s", resp)
+        logging.info("[GTP] <- %s", resp)
         return resp
 
     def del_tunnel(self, ue_ip: str) -> dict:
         msg = {"cmd": "DEL", "ue_ip": ue_ip}
-        logging.debug("[GTP] -> DEL %s", ue_ip)
+        logging.info("[GTP] -> DEL %s", ue_ip)
         resp = self._request(msg)
-        logging.debug("[GTP] <- %s", resp)
+        logging.info("[GTP] <- %s", resp)
         return resp
 
     def modify_tunnel(self, ue_ip: str, teid: int, remote_ip: str) -> dict:
         msg = {"cmd": "MODIFY", "ue_ip": ue_ip,
                "teid": teid, "remote_ip": remote_ip}
-        logging.debug("[GTP] -> MODIFY %s teid=%d remote=%s",
+        logging.info("[GTP] -> MODIFY %s teid=%d remote=%s",
                       ue_ip, teid, remote_ip)
         resp = self._request(msg)
-        logging.debug("[GTP] <- %s", resp)
+        logging.info("[GTP] <- %s", resp)
         return resp
 
     def sync(self) -> dict:

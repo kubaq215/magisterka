@@ -4,7 +4,7 @@ ovs-vsctl add-br br0
 
 # Start gtp-endpoint.py (creates gtp0 as TAP now)
 # Then add gtp0 to OVS
-ovs-vsctl add-port br0 gtp0
+ovs-vsctl add-port br0 gtp0 -- set Interface gtp0 ofport_request=1
 
 # Create veth pair: veth-ovs goes into OVS, veth-ext stays in kernel
 ip link add veth-ovs type veth peer name veth-ext
@@ -17,7 +17,7 @@ ip link set veth-ovs up
 ip link set veth-ext up
 
 # Add one end to OVS
-ovs-vsctl add-port br0 veth-ovs
+ovs-vsctl add-port br0 veth-ovs -- set Interface veth-ovs ofport_request=2
 
 # Give veth-ext a transit /30 (NOT the UE /16 — that would make the
 # kernel treat UE traffic as local instead of forwarding it)

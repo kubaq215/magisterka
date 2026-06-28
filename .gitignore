@@ -10,3 +10,4 @@ chapters/*
 **/__pycache__/*
 writing/*
 prace/*
+.specstory/

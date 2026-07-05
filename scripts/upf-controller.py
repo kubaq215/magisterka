@@ -16,6 +16,12 @@ Usage:
     ovs-vsctl set-controller br0 tcp:127.0.0.1:6653
 """
 
+import eventlet
+eventlet.monkey_patch()
+
+import logging
+logging.getLogger("ryu.base.app_manager").setLevel(logging.WARNING)
+
 import configparser
 import json
 import logging

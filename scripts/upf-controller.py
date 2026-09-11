@@ -10,7 +10,7 @@ upf-controller.py  –  Ryu-based UPF Control Plane
    the GTP endpoint via the SYNC command.
 
 Usage:
-  ryu-manager upf-controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
+  ryu-manager scripts/upf-controller.py --wsapi-host 0.0.0.0 --wsapi-port 8080
 
   Then point OVS at this controller:
     ovs-vsctl set-controller br0 tcp:127.0.0.1:6653

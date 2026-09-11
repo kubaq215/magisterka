@@ -36,6 +36,3 @@ sysctl -w net.ipv4.ip_forward=1
 
 # Masquerade UE traffic to the outside world (e.g., for ping)
 sudo iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -j MASQUERADE
-
-ovs-vsctl set-controller br0 tcp:192.168.50.50:6653
-ovs-vsctl set bridge br0 protocols=OpenFlow13
